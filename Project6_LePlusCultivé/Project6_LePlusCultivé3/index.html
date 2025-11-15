@@ -1,0 +1,751 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Match de Génie en Herbe</title>
+    <!-- Tailwind CSS CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Font Inter (Pour un look moderne) -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&display=swap" rel="stylesheet">
+    <style>
+        body { font-family: 'Inter', sans-serif; background-color: #0d1117; color: #c9d1d9; }
+        .quiz-card { background-color: #161b22; border: 1px solid #30363d; }
+        .timer-ring { animation: pulse-red 1.5s infinite; }
+        @keyframes pulse-red { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+        .correct-feedback { background-color: #238636; border-color: #3f6e4a; }
+        .incorrect-feedback { background-color: #da3633; border-color: #8c3b3b; }
+        .loading-ring { border-top-color: #58a6ff; animation: spin 1s linear infinite; }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+        /* Style pour la surbrillance des réponses justes/fausses dans le récapitulatif */
+        .summary-correct { color: #238636; font-weight: 700; }
+        .summary-incorrect { color: #da3633; font-weight: 700; }
+        .pause-overlay { backdrop-filter: blur(8px); }
+    </style>
+</head>
+<body class="p-4 md:p-8 min-h-screen flex flex-col items-center justify-center">
+
+    <h1 class="text-4xl md:text-5xl font-extrabold mb-8 text-white text-center">
+        🏆 Match de Génie en Herbe
+    </h1>
+
+    <main id="app-container" class="w-full max-w-4xl">
+        <!-- Contenu de l'application rendu par JavaScript -->
+    </main>
+    
+    <!-- Modal pour les messages et le feedback -->
+    <div id="modal" class="fixed inset-0 bg-black bg-opacity-75 hidden items-center justify-center z-50">
+        <div id="modal-content" class="p-6 rounded-lg shadow-2xl w-11/12 max-w-lg text-center quiz-card">
+            <h2 id="modal-title" class="text-2xl font-bold mb-4"></h2>
+            <p id="modal-message" class="mb-6 text-lg"></p>
+            <div class="flex justify-center space-x-4">
+                <button id="modal-button" class="px-6 py-2 rounded-lg font-semibold text-white bg-blue-600 hover:bg-blue-700 transition duration-150">Continuer</button>
+                <button id="modal-cancel-button" class="hidden px-6 py-2 rounded-lg font-semibold text-white bg-gray-600 hover:bg-gray-700 transition duration-150">Annuler</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Firebase Imports -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, collection, query, orderBy, onSnapshot, doc, setDoc, getDocs, limit, serverTimestamp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        
+        // setLogLevel('Debug'); // Décommenter pour le débogage de Firestore
+
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : null;
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-quiz-app';
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+        let app, db, auth;
+        let gameState = {
+            view: 'login', // 'login', 'quiz', 'results', 'summary'
+            userName: '',
+            userFirstName: '',
+            userId: null,
+            currentScore: 0,
+            currentQIndex: 0,
+            timer: 0, // Temps restant
+            initialTimer: 15, // Temps initial pour la question actuelle
+            timerInterval: null,
+            leaderboard: [],
+            isAuthReady: false,
+            isPaused: false,
+            userAnswers: [], // Pour stocker { question, correctAnswer, userAnswer, points, isCorrect }
+        };
+
+        // Mélanger les questions une seule fois au démarrage
+        const QUIZ_DATA_SHUFFLED = [
+            // Duel des Capitaines
+            { section: "Duel des capitaines", points: 20, question: "Écrivain britannique d'origine indienne, j'ai écrit une œuvre qui a suscité de profonds remous dans le monde m'obligeant à me cacher pour échapper à des menaces de mort, notamment une fatwa émise par l'Ayatollah Khamenei en personne. Quel est le nom de cette œuvre ? Je précise que je m'appelle Salman Rushdie.", answer: "Les versets sataniques" },
+            { section: "Duel des capitaines", points: 20, question: "Dans quel pays peut-on visiter Man, Daloa, Gagnoa et Korhogo ?", answer: "la Côte d'Ivoire" },
+            { section: "Duel des capitaines", points: 20, question: "Médecin et criminaliste italien né en 1835 et mort en 1909, il est l'un des fondateurs de la criminologie moderne. Il développa la théorie du criminel-né. Comment s'appelle-t-il ?", answer: "Cesare LOMBROSO" },
+            { section: "Duel des capitaines", points: 20, question: "Quel nom masculin invariable, d'origine latine signifie 'aveu' ou 'repentir d'une faute commise' ?", answer: "Mea-culpa" },
+            { section: "Duel des capitaines", points: 20, question: "Définissez l'acronyme SONAR ?", answer: "Sound Navigation Ranging" },
+            { section: "Duel des capitaines", points: 20, question: "Dans quel pays une femme devient pour la première fois bachelière le 17 Aout 1861 ?", answer: "France" },
+            { section: "Duel des capitaines", points: 20, question: "Comment appelle-t-on encore l'étude des sceaux ?", answer: "la sigillographie" },
+            { section: "Duel des capitaines", points: 20, question: "En quelle année Karl Wilhelm Roentgen reçut-il le Prix Nobel de Physique pour sa découverte des rayons X ?", answer: "1901" },
+            { section: "Duel des capitaines", points: 20, question: "En Iran, le refus du port de quel accessoire vestimentaire par les femmes est puni de 70 coups de fouets et de 60 jours d'emprisonnement ?", answer: "L’Hijab" },
+            { section: "Duel des capitaines", points: 20, question: "Comment appelle-t-on une tour élevée portant au sommet une puissante source lumineuse destinée à guider les navires durant la nuit ?", answer: "Un phare" },
+            // Éclairs
+            { section: "Éclairs", points: 10, question: "Mesurant 828m de haut et se trouvant à Dubaï, c'est la plus haute tour du monde. Combien d'étages fait-elle exactement ?", answer: "164 étages" },
+            { section: "Éclairs", points: 10, question: "En médecine comment appelle-t-on cette maladie due à un manque de vitamine B1 et qui se traduit par un œdème du corps et un engourdissement et une faiblesse des jambes?", answer: "Béri-béri" },
+            { section: "Éclairs", points: 10, question: "Quelle couleur est intermédiaire entre le blanc et le noir ?", answer: "Gris" },
+            { section: "Éclairs", points: 10, question: "Comment appelle-t-on l'angoisse ou la peur que l'on ressent juste avant de se produire en public ou de mettre un projet à exécution ?", answer: "le trac" },
+            { section: "Éclairs", points: 10, question: "Quelle ville du Japon sur l'île de Honshu a donné son nom à son industrie automobile qui est l'une des grandes du marché mondial ?", answer: "Toyota" },
+            { section: "Éclairs", points: 10, question: "Etoile massive ayant atteint un stade avancé de son évolution, qui explose et se manifeste temporairement par un éclat beaucoup plus élevé ?", answer: "Supernova" },
+            // Collectives (A-B)
+            { section: "Collectives", points: 10, question: "Quelle figure de style consiste à atténuer ce que l'on pense en en disant le moins pour en faire entendre le plus ?", answer: "La litote" },
+            { section: "Collectives", points: 10, question: "Quel procédé stylistique consiste à employer un terme concret pour exprimer un terme abstrait de façon plus imagée et cela sans recourir à un comparateur ?", answer: "La métaphore" },
+            { section: "Collectives", points: 10, question: "Quel détective anglais est né sous la plume de Sir Arthur Conan Doyle et a pour habitude de dire à son fidèle ami et confident : 'élémentaire mon cher Watson' ?", answer: "Sherlock Holmes" },
+            { section: "Collectives", points: 10, question: "Quel gentleman cambrioleur imaginé par l'écrivain Maurice Leblanc en 1907 vole les malhonnêtes gens au profit des malheureux?", answer: "Arsène Lupin" },
+            // Identification (Simplifié)
+            { section: "Identification (Dubaï)", points: 50, question: "Première ville des Émirats Arabes Unis, devant la capitale fédérale Abu Dhabi, située dans le golfe Persique. Je suis la ville du fort d'Al Fahidi, des Palm Islands et de Burj Khalifa. Je suis...", answer: "Dubaï" },
+            { section: "Identification (Tolérance)", points: 50, question: "Attitude à laquelle l'ONU consacre, chaque 16 novembre, une journée internationale. Capacité à accepter des opinions que l'on ne partage pas. Je suis...", answer: "La tolérance" },
+            // Lettre du Match (M)
+            { section: "Lettre du match (M)", points: 10, question: "Comment appelle-t-on en médecine le flux périodique chez la femme de liquide sanglant et que l'on désigne souvent par des règles ?", answer: "les menstrues" },
+            { section: "Lettre du match (M)", points: 10, question: "Quelle échelle, mise au point au XIXᵉ siècle, permet de classer les minéraux et roches selon leur dureté, du plus tendre au plus résistant ?", answer: "Échelle de Mohs" },
+            { section: "Lettre du match (M)", points: 10, question: "Dérivé de l'espagnol 'vagabond' comment se nomment les chevaux sauvages d'Amérique du Nord ?", answer: "Mustang" },
+            { section: "Lettre du match (M)", points: 10, question: "Dans quel pays trouve-ton le Pays Dogon et les falaises de Bandiagara ?", answer: "Mali" },
+            { section: "Lettre du match (M)", points: 10, question: "Quel métal est à la base de tout alliage nommé amalgame ?", answer: "Le mercure" },
+            // Mot du jour
+            { section: "Mot du jour", points: 80, question: "En agriculture, c'est l'alternance ou la succession méthodique de cultures sur un même sol, mais elle se définit généralement aussi comme le mouvement d'un corps qui tourne autour d'un axe. Qu'est-ce alors ?", answer: "La rotation" },
+            // Face-à-Face
+            { section: "Face-à-face", points: 15, question: "Quel gouverneur allemand ayant administré de 1886 à 1889, transféra la capitale de Baguida à Zébé ?", answer: "Ernest FALKENTHAL" },
+            { section: "Face-à-face", points: 15, question: "En 30 années de colonisation, combien de gouverneurs allemands ont administré le Togo ?", answer: "7" },
+            { section: "Face-à-face", points: 15, question: "Quel étudiant patriote serbe fut à l'origine de la 1ere guerre mondiale en commettant un attentat à Sarajevo sur l'archiduc d'Autriche et sa femme ?", answer: "Gavrilo PRINCIP" },
+            { section: "Face-à-face", points: 15, question: "Quel événement historique de la Seconde Guerre mondiale était annoncé par le message codé commençant par les mots : 'Les sanglots longs des violons...' ?", answer: "Le débarquement en Normandie" },
+            // Spécialités (Histoire)
+            { section: "Spécialités (Histoire)", points: 10, question: "Quel président américain a signé la proclamation d’émancipation des esclaves en 1863 ?", answer: "Abraham Lincoln" },
+            { section: "Spécialités (Histoire)", points: 10, question: "Qui fut le premier empereur romain, initiateur du Principat et fondateur de l’Empire romain ?", answer: "Auguste" },
+            { section: "Spécialités (Histoire)", points: 10, question: "Quelle bataille de 1066 a permis à Guillaume le Conquérant de devenir roi d’Angleterre ?", answer: "La bataille d’Hastings" },
+            { section: "Spécialités (Histoire)", points: 10, question: "Quel explorateur portugais a contourné l’Afrique pour atteindre l’Inde en 1498 ?", answer: "Vasco de Gama" },
+            { section: "Spécialités (Histoire)", points: 10, question: "Quel mur, symbole de la guerre froide, a séparé Berlin-Ouest et Berlin-Est de 1961 à 1989 ?", answer: "Le mur de Berlin" },
+            // Spécialités (Géographie)
+            { section: "Spécialités (Géographie)", points: 10, question: "Quel pays possède le plus grand nombre de fuseaux horaires, en comptant ses territoires d’outre-mer ?", answer: "La France" },
+            { section: "Spécialités (Géographie)", points: 10, question: "Quel désert, situé en Asie centrale, est le plus vaste en superficie après le Sahara ?", answer: "Le désert de Gobi" },
+            { section: "Spécialités (Géographie)", points: 10, question: "Quel lac africain est le plus profond et se situe dans la vallée du Rift ?", answer: "Le lac Tanganyika" },
+            { section: "Spécialités (Géographie)", points: 10, question: "Quel pays africain possède la plus longue façade maritime sur l’océan Atlantique ?", answer: "L’Angola" },
+            { section: "Spécialités (Géographie)", points: 10, question: "Quel est le plus grand pays enclavé du monde ?", answer: "Le Kazakhstan" },
+        ].sort(() => Math.random() - 0.5); // Mélange des questions
+
+        // --- Fonctions d'Utilité ---
+
+        function getUserId() {
+            const userId = auth.currentUser?.uid || (typeof crypto !== 'undefined' ? crypto.randomUUID() : 'anonymous-' + Math.random().toString(36).substring(2, 9));
+            return userId;
+        }
+
+        const appContainer = document.getElementById('app-container');
+        const modal = document.getElementById('modal');
+        const modalTitle = document.getElementById('modal-title');
+        const modalMessage = document.getElementById('modal-message');
+        const modalButton = document.getElementById('modal-button');
+        const modalCancelButton = document.getElementById('modal-cancel-button');
+        let quizTimerTimeout = null;
+
+        /**
+         * Affiche une modale de confirmation ou d'information.
+         * @param {string} title - Titre de la modale.
+         * @param {string} message - Message dans la modale.
+         * @param {function} callback - Fonction à exécuter lors de la confirmation.
+         * @param {function} [cancelCallback] - Fonction à exécuter lors de l'annulation (si confirmation requise).
+         */
+        function showModal(title, message, callback, cancelCallback = null) {
+            modalTitle.textContent = title;
+            modalMessage.innerHTML = message;
+            modal.classList.remove('hidden');
+            modal.classList.add('flex');
+            
+            modalButton.textContent = cancelCallback ? "Confirmer" : "Continuer";
+            modalButton.onclick = () => {
+                modal.classList.add('hidden');
+                modal.classList.remove('flex');
+                if (callback) callback();
+            };
+
+            if (cancelCallback) {
+                modalCancelButton.classList.remove('hidden');
+                modalCancelButton.textContent = "Annuler";
+                modalCancelButton.onclick = () => {
+                    modal.classList.add('hidden');
+                    modal.classList.remove('flex');
+                    cancelCallback();
+                };
+            } else {
+                modalCancelButton.classList.add('hidden');
+            }
+        }
+
+        /**
+         * Nettoie une chaîne de réponse pour une comparaison de base (minuscule, sans accent ni ponctuation)
+         * @param {string} answer - La chaîne de réponse.
+         * @returns {string} La chaîne nettoyée.
+         */
+        function cleanAnswer(answer) {
+            // Nettoie les accents et la casse. Conserve les espaces et traits d'union pour une meilleure lecture Levenshtein.
+            // Utilise .normalize('NFD').replace(/[\u0300-\u036f]/g, "") pour retirer les accents
+            return answer
+                .toLowerCase()
+                .normalize('NFD').replace(/[\u0300-\u036f]/g, "")
+                .replace(/[.,\/#!$%\^&\*;:{}=\-_`~()]/g, "") // Supprime la ponctuation courante
+                .trim();
+        }
+
+        /**
+         * Calcule la distance de Levenshtein (nombre minimal d'éditions nécessaires) entre deux mots.
+         * Utilisé pour la tolérance aux fautes de frappe.
+         * @param {string} a - Première chaîne.
+         * @param {string} b - Deuxième chaîne.
+         * @returns {number} La distance d'édition.
+         */
+        function getEditDistance(a, b) {
+            if (a.length === 0) return b.length;
+            if (b.length === 0) return a.length;
+
+            const matrix = [];
+
+            for (let i = 0; i <= b.length; i++) {
+                matrix[i] = [i];
+            }
+            for (let j = 0; j <= a.length; j++) {
+                matrix[0][j] = j;
+            }
+
+            for (let i = 1; i <= b.length; i++) {
+                for (let j = 1; j <= a.length; j++) {
+                    const cost = a[j - 1] === b[i - 1] ? 0 : 1;
+                    matrix[i][j] = Math.min(
+                        matrix[i - 1][j] + 1,       // Suppression
+                        matrix[i][j - 1] + 1,       // Insertion
+                        matrix[i - 1][j - 1] + cost // Substitution
+                    );
+                }
+            }
+            return matrix[b.length][a.length];
+        }
+
+        // --- Logique Firestore ---
+
+        async function initFirebase() {
+            try {
+                if (firebaseConfig) {
+                    app = initializeApp(firebaseConfig);
+                    db = getFirestore(app);
+                    auth = getAuth(app);
+
+                    if (initialAuthToken) {
+                        await signInWithCustomToken(auth, initialAuthToken);
+                    } else {
+                        await signInAnonymously(auth);
+                    }
+                    gameState.userId = getUserId();
+                    gameState.isAuthReady = true;
+                    console.log("Firebase et Authentification prêts. User ID:", gameState.userId);
+                    renderApp();
+                    setupLeaderboardListener();
+                } else {
+                    console.error("Firebase config is missing.");
+                    showModal("Erreur de Configuration", "La configuration Firebase est manquante. Le classement ne sera pas sauvegardé.", () => {
+                         gameState.isAuthReady = false;
+                         renderApp();
+                    });
+                }
+            } catch (error) {
+                console.error("Erreur d'initialisation Firebase:", error);
+                showModal("Erreur", "Problème de connexion à la base de données. Le classement ne sera pas sauvegardé.", () => {
+                    gameState.isAuthReady = false;
+                    renderApp();
+                });
+            }
+        }
+
+        function getPublicScoresCollectionRef() {
+            return collection(db, 'artifacts', appId, 'public/data/scores');
+        }
+
+        async function saveScore() {
+            if (!gameState.isAuthReady || gameState.currentScore === 0) return;
+
+            const userRef = doc(getPublicScoresCollectionRef(), gameState.userId);
+            const scoreData = {
+                id: gameState.userId,
+                name: `${gameState.userFirstName} ${gameState.userName}`,
+                score: gameState.currentScore,
+                timestamp: serverTimestamp(),
+            };
+
+            try {
+                // Utiliser setDoc avec merge: true pour ne pas écraser les autres champs potentiels
+                await setDoc(userRef, scoreData, { merge: true });
+                console.log("Score enregistré avec succès.");
+            } catch (e) {
+                console.error("Erreur lors de l'enregistrement du score: ", e);
+            }
+        }
+
+        function setupLeaderboardListener() {
+            if (!gameState.isAuthReady) return;
+
+            // Retrait du second orderBy pour éviter l'erreur d'index non créé.
+            const scoresQuery = query(
+                getPublicScoresCollectionRef(),
+                orderBy('score', 'desc'),
+                limit(10) 
+            );
+
+            onSnapshot(scoresQuery, (snapshot) => {
+                let leaderboard = [];
+                snapshot.forEach((doc) => {
+                    leaderboard.push(doc.data());
+                });
+
+                // Tri côté client pour gérer les ex æquo : Score (desc), Timestamp (desc)
+                leaderboard.sort((a, b) => {
+                    if (a.score !== b.score) {
+                        return b.score - a.score;
+                    }
+                    const timeA = a.timestamp?.seconds || 0;
+                    const timeB = b.timestamp?.seconds || 0;
+                    return timeB - timeA;
+                });
+                
+                gameState.leaderboard = leaderboard;
+                console.log("Classement mis à jour.");
+                renderApp(); 
+            }, (error) => {
+                console.error("Erreur d'écoute du classement:", error);
+            });
+        }
+
+
+        // --- Logique du Jeu ---
+
+        function startQuiz() {
+            const nameInput = document.getElementById('name-input');
+            const firstNameInput = document.getElementById('firstname-input');
+
+            if (!nameInput.value.trim() || !firstNameInput.value.trim()) {
+                showModal("Attention", "Veuillez entrer votre nom et prénom pour commencer la compétition.");
+                return;
+            }
+
+            gameState.userName = nameInput.value.trim();
+            gameState.userFirstName = firstNameInput.value.trim();
+            
+            // Vérification de la règle "ne peut jouer qu'une seule fois" (par ID)
+            const hasExistingScore = gameState.leaderboard.some(item => item.id === gameState.userId);
+
+            if (hasExistingScore) {
+                showModal(
+                    "Partie Déjà Terminée", 
+                    `Un score a déjà été enregistré pour cet identifiant (${gameState.userId}). Vous ne pouvez pas recommencer le match. Vous pouvez consulter le récapitulatif de votre dernière partie.`, 
+                    () => {
+                        gameState.view = 'results';
+                        renderApp();
+                    }
+                );
+                return;
+            }
+
+            // Réinitialisation de la partie
+            gameState.currentScore = 0;
+            gameState.currentQIndex = 0;
+            gameState.userAnswers = []; // Réinitialise l'historique des réponses
+            gameState.view = 'quiz';
+            renderApp();
+            startQuestion();
+        }
+
+        function startTimer() {
+            // Logique du minuteur dynamique : 10s par ligne (estimée à 50 caractères), minimum 15s
+            const currentQ = QUIZ_DATA_SHUFFLED[gameState.currentQIndex];
+            const charCount = currentQ.question.length;
+            const estimatedLines = Math.ceil(charCount / 50); // 50 caractères par ligne
+            
+            gameState.initialTimer = Math.max(15, estimatedLines * 10);
+            gameState.timer = gameState.initialTimer;
+            
+            clearInterval(gameState.timerInterval);
+            gameState.timerInterval = setInterval(() => {
+                if (gameState.isPaused) return;
+
+                gameState.timer--;
+                const timerDisplay = document.getElementById('timer-display');
+                if (timerDisplay) timerDisplay.textContent = gameState.timer;
+
+                const timerRing = document.getElementById('timer-ring');
+                if (timerRing) {
+                    if (gameState.timer <= 5) {
+                        timerRing.classList.add('timer-ring');
+                    } else {
+                        timerRing.classList.remove('timer-ring');
+                    }
+                }
+
+                if (gameState.timer <= 0) {
+                    clearInterval(gameState.timerInterval);
+                    processAnswer(document.getElementById('answer-input').value, true);
+                }
+            }, 1000);
+        }
+
+        function pauseQuiz() {
+            if (gameState.isPaused) {
+                // Reprendre
+                gameState.isPaused = false;
+                startTimer(); // Redémarre le compte à rebours avec le temps restant
+                renderApp(); 
+            } else {
+                // Pause
+                gameState.isPaused = true;
+                clearInterval(gameState.timerInterval);
+                renderApp(); 
+            }
+        }
+
+        function abandonQuiz() {
+            showModal(
+                "Abandonner la Partie",
+                "Êtes-vous sûr de vouloir abandonner le match ? Votre score actuel ne sera pas enregistré.",
+                () => {
+                    // Confirmation d'abandon
+                    clearInterval(gameState.timerInterval);
+                    clearTimeout(quizTimerTimeout);
+                    // Réinitialisation de l'état pour permettre de rejouer
+                    gameState.currentScore = 0;
+                    gameState.currentQIndex = 0;
+                    gameState.userAnswers = [];
+                    gameState.view = 'login';
+                    gameState.isPaused = false;
+                    renderApp();
+                },
+                () => {
+                    // Annulation
+                    // Ne rien faire
+                }
+            );
+        }
+
+        function processAnswer(userAnswer, isTimedOut = false) {
+            clearInterval(gameState.timerInterval);
+            const currentQ = QUIZ_DATA_SHUFFLED[gameState.currentQIndex];
+            const cleanUserAnswer = cleanAnswer(userAnswer);
+            const cleanCorrectAnswer = cleanAnswer(currentQ.answer);
+
+            // 1. Déterminer la tolérance (Max 2 fautes)
+            const maxEditDistance = Math.min(2, Math.ceil(cleanCorrectAnswer.length * 0.2)); 
+
+            // 2. Comparaison avec Levenshtein
+            const distance = getEditDistance(cleanUserAnswer, cleanCorrectAnswer);
+
+            // La réponse est considérée comme correcte si la distance est dans la tolérance
+            const isCorrect = distance <= maxEditDistance;
+            
+            const pointsAwarded = isCorrect ? currentQ.points : 0;
+            gameState.currentScore += pointsAwarded;
+
+            // Enregistrer la réponse pour le récapitulatif
+            gameState.userAnswers.push({
+                index: gameState.currentQIndex + 1,
+                question: currentQ.question,
+                correctAnswer: currentQ.answer,
+                userAnswer: userAnswer.trim() || 'N/A (Temps écoulé)',
+                points: currentQ.points,
+                pointsAwarded: pointsAwarded,
+                isCorrect: isCorrect,
+                section: currentQ.section
+            });
+
+            const feedbackTitle = isCorrect ? "CORRECT !" : "INCORRECT !";
+            const feedbackClass = isCorrect ? "correct-feedback" : "incorrect-feedback";
+            let feedbackMessage = `${isTimedOut ? "Temps écoulé. " : ""} ${isCorrect ? `Tolérance acceptée. Vous gagnez ${pointsAwarded} points.` : 'Pas de point.'} <br>La bonne réponse était : <strong>${currentQ.answer}</strong>.`;
+            
+            if (!isCorrect && !isTimedOut) {
+                feedbackMessage += `<br><span class="text-sm text-gray-200">Distance d'édition: ${distance} (Max toléré: ${maxEditDistance})</span>`;
+            }
+
+            const nextQuestion = () => {
+                gameState.currentQIndex++;
+                if (gameState.currentQIndex < QUIZ_DATA_SHUFFLED.length) {
+                    startQuestion();
+                } else {
+                    endQuiz();
+                }
+            };
+            
+            // Mise à jour visuelle du conteneur de question
+            const questionContainer = document.getElementById('question-container');
+            if (questionContainer) {
+                questionContainer.innerHTML = `<div class="p-8 text-white rounded-xl ${feedbackClass} transition-all duration-300">
+                    <h3 class="text-3xl font-extrabold mb-4">${feedbackTitle}</h3>
+                    <p class="text-xl">${feedbackMessage}</p>
+                </div>`;
+            }
+            
+            // Masquer le bouton de soumission et la zone de réponse
+            document.getElementById('submit-button')?.classList.add('hidden');
+            document.getElementById('answer-input')?.setAttribute('disabled', 'true');
+
+            // Passer à la question suivante après 3 secondes
+            quizTimerTimeout = setTimeout(nextQuestion, 3000); 
+        }
+
+        function startQuestion() {
+            const currentQ = QUIZ_DATA_SHUFFLED[gameState.currentQIndex];
+            renderQuizView(currentQ);
+            startTimer();
+            // On s'assure que le focus est mis sur la zone de réponse après le rendu
+            setTimeout(() => document.getElementById('answer-input')?.focus(), 0);
+        }
+
+        function endQuiz() {
+            saveScore();
+            gameState.view = 'results';
+            renderApp();
+        }
+        
+        // --- Rendu des Vues ---
+
+        function renderLoginView() {
+            appContainer.innerHTML = `
+                <div class="quiz-card p-8 rounded-xl shadow-2xl w-full max-w-md mx-auto">
+                    <h2 class="text-3xl font-bold mb-6 text-white text-center">Bienvenue, Génie en Herbe</h2>
+                    <p class="text-gray-400 mb-6 text-center">Veuillez entrer vos informations pour commencer la compétition et enregistrer votre score.</p>
+                    <div class="space-y-4">
+                        <input id="firstname-input" type="text" placeholder="Votre Prénom" class="w-full p-3 rounded-lg bg-gray-700 text-white border-none focus:ring-2 focus:ring-blue-500" value="${gameState.userFirstName}">
+                        <input id="name-input" type="text" placeholder="Votre Nom" class="w-full p-3 rounded-lg bg-gray-700 text-white border-none focus:ring-2 focus:ring-blue-500" value="${gameState.userName}">
+                    </div>
+                    <button id="start-button" class="mt-8 w-full py-3 rounded-lg font-bold text-xl text-white bg-green-600 hover:bg-green-700 transition duration-150 shadow-lg">
+                        Démarrer le Match
+                    </button>
+                    <p class="text-xs text-gray-500 mt-4 text-center">ID Joueur : ${gameState.userId}</p>
+                    ${!gameState.isAuthReady ? '<p class="text-red-500 mt-4 text-sm text-center">Mode Hors Ligne : Le classement ne sera pas sauvegardé.</p>' : ''}
+                </div>
+                ${renderLeaderboard()}
+            `;
+            document.getElementById('start-button').onclick = startQuiz;
+        }
+
+        function renderQuizView(q) {
+            appContainer.innerHTML = `
+                ${gameState.isPaused ? 
+                    `<div id="pause-overlay" class="pause-overlay absolute inset-0 flex items-center justify-center z-40 quiz-card rounded-xl">
+                        <div class="p-10 text-center">
+                            <h3 class="text-4xl font-extrabold text-blue-400 mb-6">PAUSE</h3>
+                            <button id="resume-button" class="py-3 px-8 rounded-lg font-bold text-white bg-green-600 hover:bg-green-700 transition duration-150 shadow-lg">
+                                Reprendre la Partie
+                            </button>
+                        </div>
+                    </div>` : ''
+                }
+                <div class="flex flex-col md:flex-row gap-8 relative ${gameState.isPaused ? 'opacity-20 pointer-events-none' : ''}">
+                    <!-- Zone de Quiz (à gauche) -->
+                    <div class="md:w-3/4 flex flex-col space-y-6">
+                        <div class="quiz-card p-4 rounded-xl flex justify-between items-center shadow-lg">
+                            <div class="text-xl font-semibold">
+                                Question <span id="q-number">${gameState.currentQIndex + 1}</span> sur ${QUIZ_DATA_SHUFFLED.length}
+                            </div>
+                            <div class="text-2xl font-bold text-yellow-400">
+                                Score: <span id="score-display">${gameState.currentScore}</span> Pts
+                            </div>
+                        </div>
+
+                        <div id="question-container" class="quiz-card p-6 md:p-8 rounded-xl shadow-xl min-h-[250px] flex flex-col justify-center">
+                            <p class="text-lg text-blue-400 font-medium mb-3">
+                                Rubrique : ${q.section} (Valeur : ${q.points} points)
+                            </p>
+                            <p class="text-2xl md:text-3xl font-semibold text-white">
+                                <span class="text-yellow-400 mr-2">${gameState.currentQIndex + 1}.</span> ${q.question}
+                            </p>
+                        </div>
+                        
+                        <div class="mt-4 flex flex-col md:flex-row gap-4">
+                            <input id="answer-input" type="text" placeholder="Votre réponse..." class="w-full p-4 rounded-lg bg-gray-700 text-white border-none text-xl focus:ring-4 focus:ring-blue-500 transition" autocomplete="off">
+                            <button id="submit-button" class="py-4 px-6 rounded-lg font-bold text-white bg-blue-600 hover:bg-blue-700 transition duration-150 flex-shrink-0">
+                                Valider
+                            </button>
+                        </div>
+                    </div>
+
+                    <!-- Chronomètre & Contrôles (à droite) -->
+                    <div class="md:w-1/4 flex flex-col items-center justify-start py-4 space-y-4">
+                        <div id="timer-ring" class="relative w-40 h-40 flex items-center justify-center rounded-full border-4 border-red-500/50">
+                            <div class="absolute inset-0 flex items-center justify-center">
+                                <span id="timer-display" class="text-6xl font-extrabold text-red-500">${gameState.timer}</span>
+                            </div>
+                            <div class="absolute bottom-4 text-red-500 font-semibold">SECONDES</div>
+                        </div>
+                        <div class="flex flex-col space-y-2 w-full max-w-[160px]">
+                            <button id="pause-button" class="py-2 px-4 rounded-lg font-semibold text-white bg-yellow-600 hover:bg-yellow-700 transition duration-150">
+                                Pause
+                            </button>
+                            <button id="abandon-button" class="py-2 px-4 rounded-lg font-semibold text-white bg-red-600 hover:bg-red-700 transition duration-150">
+                                Abandonner
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            `;
+            
+            if (gameState.isPaused) {
+                document.getElementById('resume-button').onclick = pauseQuiz;
+            } else {
+                document.getElementById('submit-button').onclick = () => {
+                    const answer = document.getElementById('answer-input').value;
+                    if (answer.trim()) {
+                        processAnswer(answer);
+                    } else {
+                        showModal("Réponse Requise", "Veuillez entrer une réponse avant de valider.");
+                    }
+                };
+            }
+            document.getElementById('pause-button').onclick = pauseQuiz;
+            document.getElementById('abandon-button').onclick = abandonQuiz;
+        }
+
+        function renderResultsView() {
+            appContainer.innerHTML = `
+                <div class="quiz-card p-10 rounded-xl shadow-2xl w-full mx-auto text-center mb-8">
+                    <h2 class="text-5xl font-extrabold text-green-400 mb-4">Match Terminé !</h2>
+                    <p class="text-3xl text-white mb-6">Félicitations, ${gameState.userFirstName} !</p>
+                    <p class="text-6xl font-black text-yellow-400">${gameState.currentScore}</p>
+                    <p class="text-2xl text-gray-300">Points Totaux</p>
+                    <div class="flex justify-center space-x-4 mt-8">
+                        <button id="summary-button" class="py-3 px-8 rounded-lg font-bold text-white bg-purple-600 hover:bg-purple-700 transition duration-150 shadow-lg">
+                            Voir le Récapitulatif
+                        </button>
+                        <button id="restart-button" class="py-3 px-8 rounded-lg font-bold text-white bg-blue-600 hover:bg-blue-700 transition duration-150 shadow-lg">
+                            Retour à l'Accueil
+                        </button>
+                    </div>
+                </div>
+                ${renderLeaderboard()}
+            `;
+            document.getElementById('restart-button').onclick = () => {
+                gameState.view = 'login';
+                renderApp();
+            };
+            document.getElementById('summary-button').onclick = () => {
+                gameState.view = 'summary';
+                renderApp();
+            };
+        }
+
+        function renderSummaryView() {
+            const summaryList = gameState.userAnswers.map(ans => {
+                const answerClass = ans.isCorrect ? 'summary-correct' : 'summary-incorrect';
+                const icon = ans.isCorrect ? '✅' : '❌';
+                return `
+                    <div class="border-b border-gray-700 py-4">
+                        <p class="text-lg font-semibold mb-2">
+                            <span class="text-blue-400">${ans.index}.</span> [${ans.section}] (${ans.pointsAwarded}/${ans.points} Pts)
+                        </p>
+                        <p class="mb-1 text-white">
+                            <span class="font-bold">Question :</span> ${ans.question}
+                        </p>
+                        <p class="mb-1">
+                            <span class="font-bold text-gray-400">Votre Réponse :</span> 
+                            <span class="${answerClass}">${ans.userAnswer} ${icon}</span>
+                        </p>
+                        <p class="mb-1 text-green-500">
+                            <span class="font-bold">Bonne Réponse :</span> ${ans.correctAnswer}
+                        </p>
+                    </div>
+                `;
+            }).join('');
+
+            appContainer.innerHTML = `
+                <div class="quiz-card p-8 rounded-xl shadow-2xl w-full mx-auto text-center mb-8">
+                    <h2 class="text-4xl font-extrabold text-purple-400 mb-2">Récapitulatif de la Partie</h2>
+                    <p class="text-2xl text-white mb-6">Score Final: <span class="text-yellow-400 font-bold">${gameState.currentScore} Pts</span></p>
+                    <button id="back-to-results-button" class="py-2 px-6 rounded-lg font-bold text-white bg-blue-600 hover:bg-blue-700 transition duration-150 shadow-lg">
+                        Retour aux Résultats
+                    </button>
+                </div>
+                <div class="quiz-card p-8 rounded-xl shadow-2xl w-full mx-auto mt-6">
+                    ${summaryList.length > 0 ? summaryList : '<p class="text-center text-gray-500">Aucune question enregistrée.</p>'}
+                </div>
+            `;
+            document.getElementById('back-to-results-button').onclick = () => {
+                gameState.view = 'results';
+                renderApp();
+            };
+        }
+
+        function renderLeaderboard() {
+            const listItems = gameState.leaderboard.map((item, index) => `
+                <li class="flex justify-between items-center py-3 px-4 rounded-lg ${index < 3 ? 'bg-yellow-900/50 border-l-4 border-yellow-400' : 'bg-gray-800'} ${item.id === gameState.userId ? 'ring-2 ring-blue-500' : ''}">
+                    <span class="font-bold w-10 text-center">${index + 1}</span>
+                    <span class="flex-grow text-left">${item.name} <span class="text-xs text-gray-500">ID: ${item.id.substring(0, 8)}...</span> ${item.id === gameState.userId ? '(Vous)' : ''}</span>
+                    <span class="font-extrabold text-yellow-300">${item.score} Pts</span>
+                </li>
+            `).join('');
+
+            return `
+                <div class="mt-10 p-6 quiz-card rounded-xl shadow-2xl w-full">
+                    <h2 class="text-3xl font-bold mb-6 text-white text-center">🏅 Classement des Génies (Top 10)</h2>
+                    ${gameState.isAuthReady ? `
+                        <ul class="space-y-2 text-lg">
+                            ${listItems.length > 0 ? listItems : '<p class="text-center text-gray-500">Aucun score enregistré pour l\'instant.</p>'}
+                        </ul>
+                    ` : `
+                        <div class="p-4 bg-red-900/30 rounded-lg text-red-400 text-center">
+                            Connexion à Firestore non établie. Le classement est désactivé.
+                        </div>
+                    `}
+                </div>
+            `;
+        }
+
+        function renderApp() {
+            if (!gameState.isPaused) { // Ne pas effacer le timeout si on est en pause
+                clearTimeout(quizTimerTimeout);
+                clearInterval(gameState.timerInterval);
+                document.getElementById('timer-ring')?.classList.remove('timer-ring');
+            }
+            
+            switch (gameState.view) {
+                case 'login':
+                    renderLoginView();
+                    break;
+                case 'quiz':
+                    // Appel direct de renderQuizView si la vue change
+                    if (!gameState.isPaused) { 
+                        const currentQ = QUIZ_DATA_SHUFFLED[gameState.currentQIndex];
+                        renderQuizView(currentQ);
+                    } else {
+                         // Si on est en pause, on re-rend la vue quiz pour afficher l'overlay
+                         const currentQ = QUIZ_DATA_SHUFFLED[gameState.currentQIndex];
+                         renderQuizView(currentQ);
+                    }
+                    break;
+                case 'results':
+                    renderResultsView();
+                    break;
+                case 'summary':
+                    renderSummaryView();
+                    break;
+            }
+            // Mettre à jour le classement si la vue n'est pas "quiz"
+            if (gameState.view !== 'quiz' && gameState.isAuthReady) {
+                setupLeaderboardListener();
+            }
+        }
+
+        // --- Initialisation ---
+        window.onload = () => {
+            if (firebaseConfig) {
+                initFirebase();
+            } else {
+                console.warn("Firebase config not found. Running in local mode.");
+                gameState.isAuthReady = false;
+                renderApp();
+            }
+        };
+
+    </script>
+
+</body>
+</html>

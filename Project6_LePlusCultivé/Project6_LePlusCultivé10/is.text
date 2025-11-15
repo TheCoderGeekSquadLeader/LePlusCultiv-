@@ -1,0 +1,1084 @@
+
+    <!-- Firebase Imports -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, collection, query, orderBy, onSnapshot, doc, setDoc, getDocs, limit, serverTimestamp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        
+        // setLogLevel('Debug'); // Décommenter pour le débogage de Firestore
+
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : null;
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-quiz-app';
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+        /* ---------------------------------------------------------
+   BLOC A — INDEXEDDB "quiz_offline_db"
+   --------------------------------------------------------- */
+
+let offlineDB;
+const DB_NAME = "quiz_offline_db";
+const DB_VERSION = 1;
+
+// Ouvre ou crée la base locale
+function openOfflineDB() {
+    return new Promise((resolve, reject) => {
+        const request = indexedDB.open(DB_NAME, DB_VERSION);
+
+        request.onupgradeneeded = (event) => {
+            const db = event.target.result;
+
+            // Table des scores locaux
+            if (!db.objectStoreNames.contains("scores")) {
+                db.createObjectStore("scores", { keyPath: "id" });
+            }
+
+            // File d’attente pour sync Firestore
+            if (!db.objectStoreNames.contains("syncQueue")) {
+                db.createObjectStore("syncQueue", { keyPath: "queueId", autoIncrement: true });
+            }
+        };
+
+        request.onsuccess = (event) => {
+            offlineDB = event.target.result;
+            resolve();
+        };
+
+        request.onerror = () => reject(request.error);
+    });
+}
+
+// Sauvegarde localement
+function saveLocalScore(scoreObj) {
+    return new Promise((resolve, reject) => {
+        const tx = offlineDB.transaction(["scores"], "readwrite");
+        tx.objectStore("scores").put(scoreObj);
+
+        tx.oncomplete = resolve;
+        tx.onerror = () => reject(tx.error);
+    });
+}
+
+// Ajoute un élément dans la file d'attente (si offline)
+function queueSync(scoreObj) {
+    return new Promise((resolve, reject) => {
+        const tx = offlineDB.transaction(["syncQueue"], "readwrite");
+        tx.objectStore("syncQueue").add(scoreObj);
+
+        tx.oncomplete = resolve;
+        tx.onerror = () => reject(tx.error);
+    });
+}
+
+/* ---------------------------------------------------------
+   BLOC B — SYNC AVEC FIRESTORE
+   --------------------------------------------------------- */
+
+async function getAllQueuedScores() {
+    return new Promise((resolve, reject) => {
+        const tx = offlineDB.transaction("syncQueue", "readonly");
+        const req = tx.objectStore("syncQueue").getAll();
+
+        req.onsuccess = () => resolve(req.result || []);
+        req.onerror = () => reject(req.error);
+    });
+}
+
+async function clearQueueItem(queueId) {
+    return new Promise((resolve, reject) => {
+        const tx = offlineDB.transaction("syncQueue", "readwrite");
+        tx.objectStore("syncQueue").delete(queueId);
+
+        tx.oncomplete = resolve;
+        tx.onerror = () => reject(tx.error);
+    });
+}
+
+// Fonction qui tente la synchronisation → Firestore
+async function syncOfflineScores() {
+    if (!gameState.isAuthReady) return;
+
+    const queued = await getAllQueuedScores();
+    if (!queued.length) return;
+
+    for (const item of queued) {
+        try {
+            await addScoreToFirestore(item);
+            await clearQueueItem(item.queueId);
+        } catch (e) {
+            console.warn("Sync error → stop, will retry later", e);
+            break; // On arrête et on réessaiera plus tard
+        }
+    }
+}
+
+// On réessaie automatiquement toutes les 10 secondes
+setInterval(syncOfflineScores, 10000);
+
+        let app, db, auth;
+        let gameState = {
+            view: 'login', // 'login', 'quiz', 'results', 'summary'
+            userName: '',
+            userFirstName: '',
+            userId: null,
+            currentScore: 0,
+            currentQIndex: 0,
+            timer: 0, // Temps restant
+            initialTimer: 15, // Temps initial pour la question actuelle
+            timerInterval: null,
+            leaderboard: [],
+            isAuthReady: false,
+            isPaused: false,
+            userAnswers: [], // Pour stocker { question, correctAnswer, userAnswer, points, isCorrect }
+        };
+
+        /* ---------------------------------------------------------
+   BLOC D — TOP 10 HYBRIDE (LOCAL + FIRESTORE SI POSSIBLE)
+   --------------------------------------------------------- */
+
+async function getTop10Scores() {
+  const tx = offlineDB.transaction("scores", "readonly");
+  const req = tx.objectStore("scores").getAll();
+
+  const local = await new Promise((resolve, reject) => {
+    req.onsuccess = () => resolve(req.result || []);
+    req.onerror = () => reject(req.error);
+  });
+
+  let allScores = [...local];
+
+  if (gameState.isAuthReady && Array.isArray(gameState.leaderboard)) {
+    const online = gameState.leaderboard.map(x => ({
+      userId: x.userId || x.id,
+      name: x.name,
+      score: x.score,
+      timestamp: (x.timestamp?.seconds ? x.timestamp.seconds * 1000 : Date.now())
+    }));
+    allScores = [...allScores, ...online];
+  }
+
+  const bestByUser = new Map();
+  for (const s of allScores) {
+    if (!s.userId) continue;
+    const prev = bestByUser.get(s.userId);
+    if (!prev || s.score > prev.score) {
+      bestByUser.set(s.userId, s);
+    }
+  }
+
+  return Array.from(bestByUser.values())
+    .sort((a, b) => b.score - a.score || (b.timestamp - a.timestamp))
+    .slice(0, 10);
+}
+
+
+
+        // --- IndexedDB integration for scores (local leaderboard) ---
+
+        async function saveScoreLocal() {
+          if (!gameState.userId) {
+            gameState.userId = (typeof crypto !== 'undefined' ? crypto.randomUUID() : 'anonymous-' + Math.random().toString(36).substring(2,9));
+          }
+          const entry = {
+            id: (typeof crypto !== 'undefined' ? crypto.randomUUID() : 'score-' + Date.now()),
+            userId: gameState.userId,
+            name: `${gameState.userFirstName} ${gameState.userName}`.trim() || '(Sans nom)',
+            score: gameState.currentScore,
+            timestamp: Date.now()
+          };
+          try {
+            await idbPut('scores', entry); // fournie par idb.js
+          } catch (e) {
+            console.error('IDB save error:', e);
+          }
+          // Si hors ligne ou Firestore non prêt → file d’attente pour sync
+          if (!navigator.onLine || !gameState.isAuthReady) {
+            try {
+              await idbPut('syncQueue', entry);
+            } catch (e) {
+              console.error('IDB enqueue error:', e);
+            }
+          }
+        }
+
+        async function addScoreToFirestore(scoreObj) {
+  const ref = doc(getPublicScoresCollectionRef(), scoreObj.userId);
+  await setDoc(ref, {
+    userId: scoreObj.userId,
+    name: (scoreObj.name || '(Sans nom)').trim(),
+    score: scoreObj.score,
+    timestamp: serverTimestamp()
+  }, { merge: true });
+}
+
+
+        // Retourne top N local (meilleur score par userId)
+        async function getLocalLeaderboard(limitCount = 10) {
+          const scores = await idbGetAll('scores');
+          const bestByUser = new Map();
+          for (const s of scores) {
+            const prev = bestByUser.get(s.userId);
+            if (!prev || s.score > prev.score) bestByUser.set(s.userId, s);
+          }
+          return Array.from(bestByUser.values())
+            .sort((a,b) => b.score - a.score || (b.timestamp - a.timestamp))
+            .slice(0, limitCount);
+        }
+
+        window.addEventListener('online', async () => {
+          console.info('Connexion retrouvée — synchronisation des scores en file…');
+          if (firebaseConfig && !gameState.isAuthReady) {
+            await initFirebase(); // ta fonction existante
+          }
+          // Pousser la file d’attente vers Firestore
+          try {
+            const pending = await idbGetAll('syncQueue');
+            for (const entry of pending) {
+              try {
+                const userRef = doc(getPublicScoresCollectionRef(), entry.userId);
+                await setDoc(userRef, {
+                  id: entry.userId,
+                  name: entry.name,
+                  score: entry.score,
+                  timestamp: serverTimestamp()
+                }, { merge: true });
+                await idbDelete('syncQueue', entry.id);
+              } catch (e) {
+                console.error('Sync error for entry', entry.id, e);
+              }
+            }
+          } catch (e) {
+            console.error('SyncQueue read error:', e);
+          }
+          // Rafraîchir l’UI
+          renderApp();
+        });
+
+        window.addEventListener('offline', () => {
+          console.info('Mode hors ligne — classement local uniquement');
+        });
+
+        // Fonction d'aide pour mélanger un tableau
+        function shuffleArray(array) {
+            for (let i = array.length - 1; i > 0; i--) {
+                const j = Math.floor(Math.random() * (i + 1));
+                [array[i], array[j]] = [array[j], array[i]];
+            }
+            return array;
+        }
+
+        // Construction du tableau final des questions en respectant l'ordre des rubriques et le mélange interne sélectif
+        for (const sectionName of Object.keys(RAW_QUIZ_DATA)) {
+            let questions = [...RAW_QUIZ_DATA[sectionName]]; // Copie pour ne pas modifier l'original
+            if (SHUFFLEABLE_SECTIONS.includes(sectionName)) {
+                questions = shuffleArray(questions);
+            }
+            questions.forEach(q => {
+                QUIZ_DATA_FINAL.push({ ...q, section: sectionName });
+            });
+        }
+
+        const appContainer = document.getElementById('app-container');
+        const modal = document.getElementById('modal');
+        const modalTitle = document.getElementById('modal-title');
+        const modalMessage = document.getElementById('modal-message');
+        const modalButton = document.getElementById('modal-button');
+        const modalCancelButton = document.getElementById('modal-cancel-button');
+        let quizTimerTimeout = null;
+
+        /**
+         * Affiche une modale de confirmation ou d'information.
+         * @param {string} title - Titre de la modale.
+         * @param {string} message - Message dans la modale.
+         * @param {function} callback - Fonction à exécuter lors de la confirmation.
+         * @param {function} [cancelCallback] - Fonction à exécuter lors de l'annulation (si confirmation requise).
+         */
+        function showModal(title, message, callback, cancelCallback = null) {
+            modalTitle.textContent = title;
+            modalMessage.innerHTML = message;
+            modal.classList.remove('hidden');
+            modal.classList.add('flex');
+            
+            modalButton.textContent = cancelCallback ? "Confirmer" : "Continuer";
+            modalButton.onclick = () => {
+                modal.classList.add('hidden');
+                modal.classList.remove('flex');
+                if (callback) callback();
+            };
+
+            if (cancelCallback) {
+                modalCancelButton.classList.remove('hidden');
+                modalCancelButton.textContent = "Annuler";
+                modalCancelButton.onclick = () => {
+                    modal.classList.add('hidden');
+                    modal.classList.remove('flex');
+                    cancelCallback();
+                };
+            } else {
+                modalCancelButton.classList.add('hidden');
+            }
+        }
+
+        /**
+         * Nettoie une chaîne de réponse pour une comparaison de base (minuscule, sans accent ni ponctuation)
+         * @param {string} answer - La chaîne de réponse.
+         * @returns {string} La chaîne nettoyée.
+         */
+        function cleanAnswer(answer) {
+            // Retire les accents, passe en minuscule, et supprime la plupart des ponctuations
+            return answer
+                .toLowerCase()
+                .normalize('NFD').replace(/[\u0300-\u036f]/g, "")
+                .replace(/[.,\/#!$%\^&\*;:{}=\-_`~()]/g, "")
+                .trim();
+        }
+
+        /**
+         * Calcule la distance de Levenshtein (nombre minimal d'éditions nécessaires) entre deux mots.
+         */
+        function getEditDistance(a, b) {
+            if (a.length === 0) return b.length;
+            if (b.length === 0) return a.length;
+
+            const matrix = [];
+
+            for (let i = 0; i <= b.length; i++) {
+                matrix[i] = [i];
+            }
+            for (let j = 0; j <= a.length; j++) {
+                matrix[0][j] = j;
+            }
+
+            for (let i = 1; i <= b.length; i++) {
+                for (let j = 1; j <= a.length; j++) {
+                    const cost = a[j - 1] === b[i - 1] ? 0 : 1;
+                    matrix[i][j] = Math.min(
+                        matrix[i - 1][j] + 1,       // Suppression
+                        matrix[i][j - 1] + 1,       // Insertion
+                        matrix[i - 1][j - 1] + cost // Substitution
+                    );
+                }
+            }
+            return matrix[b.length][a.length];
+        }
+
+        // --- Logique Firestore ---
+
+        function getUserId() {
+            const userId = auth.currentUser?.uid || (typeof crypto !== 'undefined' ? crypto.randomUUID() : 'anonymous-' + Math.random().toString(36).substring(2, 9));
+            return userId;
+        }
+
+        async function initFirebase() {
+            try {
+                if (firebaseConfig) {
+                    app = initializeApp(firebaseConfig);
+                    db = getFirestore(app);
+                    auth = getAuth(app);
+
+                    if (initialAuthToken) {
+                        await signInWithCustomToken(auth, initialAuthToken);
+                    } else {
+                        await signInAnonymously(auth);
+                    }
+                    gameState.userId = getUserId();
+                    gameState.isAuthReady = true;
+                    console.log("Firebase et Authentification prêts. User ID:", gameState.userId);
+                    renderApp();
+                    setupLeaderboardListener();
+                } else {
+                    console.error("Firebase config is missing.");
+                    showModal("Erreur de Configuration", "La configuration Firebase est manquante. Le classement ne sera pas sauvegardé.", () => {
+                         gameState.isAuthReady = false;
+                         renderApp();
+                    });
+                }
+            } catch (error) {
+                console.error("Erreur d'initialisation Firebase:", error);
+                showModal("Erreur", "Problème de connexion à la base de données. Le classement ne sera pas sauvegardé.", () => {
+                    gameState.isAuthReady = false;
+                    renderApp();
+                });
+            }
+        }
+
+        function getPublicScoresCollectionRef() {
+            return collection(db, 'artifacts', appId, 'public/data/scores');
+        }
+
+        /* ---------------------------------------------------------
+   BLOC C — SAVE SCORE HYBRIDE (ONLINE + OFFLINE)
+   --------------------------------------------------------- */
+
+async function saveScore() {
+    const scoreObj = {
+        id: gameState.userId,
+        name: gameState.userFirstName + " " + gameState.userName,
+        score: gameState.currentScore,
+        timestamp: Date.now()
+    };
+
+    // 1) Sauvegarde locale (toujours)
+    await saveLocalScore(scoreObj);
+
+    // 2) Si Firebase n'est pas dispo → on queue pour plus tard
+    if (!gameState.isAuthReady) {
+        await queueSync(scoreObj);
+        console.log("🔥 Score enregistré hors-ligne + ajouté à la file d'attente.");
+        return;
+    }
+
+    // 3) En ligne → tentative Firestore
+    try {
+        await addScoreToFirestore(scoreObj);
+    } catch (err) {
+        console.warn("⚠️ Firestore inaccessible → on sauvegarde en queue", err);
+        await queueSync(scoreObj);
+    }
+}
+
+
+        function setupLeaderboardListener() {
+            if (!gameState.isAuthReady) return;
+
+            const scoresQuery = query(
+                getPublicScoresCollectionRef(),
+                orderBy('score', 'desc'),
+                limit(10) 
+            );
+
+            onSnapshot(scoresQuery, (snapshot) => {
+                let leaderboard = [];
+                snapshot.forEach((doc) => {
+                    leaderboard.push(doc.data());
+                });
+
+                leaderboard.sort((a, b) => {
+                    if (a.score !== b.score) {
+                        return b.score - a.score;
+                    }
+                    const timeA = a.timestamp?.seconds || 0;
+                    const timeB = b.timestamp?.seconds || 0;
+                    return timeB - timeA;
+                });
+                
+                gameState.leaderboard = leaderboard;
+                console.log("Classement mis à jour.");
+                renderApp(); 
+            }, (error) => {
+                console.error("Erreur d'écoute du classement:", error);
+            });
+        }
+
+
+        // --- Logique du Jeu ---
+
+        function startQuiz() {
+            const nameInput = document.getElementById('name-input');
+            const firstNameInput = document.getElementById('firstname-input');
+
+            if (!nameInput.value.trim() || !firstNameInput.value.trim()) {
+                showModal("Attention", "Veuillez entrer votre nom et prénom pour commencer la compétition.");
+                return;
+            }
+
+            gameState.userName = nameInput.value.trim();
+            gameState.userFirstName = firstNameInput.value.trim();
+            
+            // Vérification de la règle "ne peut jouer qu'une seule fois" (par ID)
+            const hasExistingScore = gameState.leaderboard.some(item => item.id === gameState.userId);
+
+            if (hasExistingScore) {
+                showModal(
+                    "Partie Déjà Terminée", 
+                    `Un score a déjà été enregistré pour cet identifiant (${gameState.userId}). Vous ne pouvez pas recommencer le match.`, 
+                    () => {
+                        gameState.view = 'results';
+                        renderApp();
+                    }
+                );
+                return;
+            }
+
+            // Réinitialisation de la partie
+            gameState.currentScore = 0;
+            gameState.currentQIndex = 0;
+            gameState.userAnswers = []; // Réinitialise l'historique des réponses
+            gameState.view = 'quiz';
+            renderApp();
+            startQuestion();
+        }
+
+        function startTimer() {
+            // Logique du minuteur dynamique : 10s par 50 caractères, minimum 15s
+            const currentQ = QUIZ_DATA_FINAL[gameState.currentQIndex];
+            const charCount = currentQ.question.length;
+            const estimatedLines = Math.ceil(charCount / 50); 
+            
+            // Réinitialisation de l'initialTimer uniquement si la question change
+            if (!gameState.isPaused) {
+                gameState.initialTimer = Math.max(15, estimatedLines * 10);
+                gameState.timer = gameState.initialTimer;
+            }
+            
+            clearInterval(gameState.timerInterval);
+            gameState.timerInterval = setInterval(() => {
+                if (gameState.isPaused) {
+                    clearInterval(gameState.timerInterval); // Stop interval si on passe en pause
+                    return;
+                }
+
+                gameState.timer--;
+                const timerDisplay = document.getElementById('timer-display');
+                if (timerDisplay) timerDisplay.textContent = gameState.timer;
+
+                const timerRing = document.getElementById('timer-ring');
+                if (timerRing) {
+                    if (gameState.timer <= 5) {
+                        timerRing.classList.add('timer-ring');
+                    } else {
+                        timerRing.classList.remove('timer-ring');
+                    }
+                }
+
+                if (gameState.timer <= 0) {
+                    clearInterval(gameState.timerInterval);
+                    processAnswer(document.getElementById('answer-input').value, true);
+                }
+            }, 1000);
+        }
+
+        function pauseQuiz() {
+            if (gameState.isPaused) {
+                // Reprendre
+                gameState.isPaused = false;
+                startTimer(); // Redémarre le compte à rebours avec le temps restant
+                renderApp(); 
+            } else {
+                // Pause
+                gameState.isPaused = true;
+                clearInterval(gameState.timerInterval);
+                renderApp(); 
+            }
+        }
+
+        function abandonQuiz() {
+    showModal(
+        "Pathétique...",
+        "Vous allez tout laisser tomber ? [...] mais ce moment ne reviendra jamais.",
+        async () => {
+
+            // Stopper les timers
+            clearInterval(gameState.timerInterval);
+            clearTimeout(quizTimerTimeout);
+
+            // Sauvegarder le score AVANT de tout réinitialiser
+            await saveScore();
+
+            // Réinitialiser la partie
+            gameState.currentQIndex = 0;
+            gameState.userAnswers = [];
+            gameState.isPaused = false;
+
+            // NE PAS remettre le score à zéro
+            // Car il vient d'être enregistré
+            // gameState.currentScore = 0; ❌ À NE PAS REMETTRE
+
+            // Retourner à la page d'accueil
+            gameState.view = 'login';
+
+            // Afficher l’accueil avec le leaderboard
+            renderApp();
+        },
+        () => {} // bouton annuler
+    );
+}
+
+
+
+        function processAnswer(userAnswer, isTimedOut = false) {
+            clearInterval(gameState.timerInterval);
+            clearTimeout(quizTimerTimeout); // S'assurer que le délai de 3s est effacé si l'utilisateur répond vite
+            
+            const currentQ = QUIZ_DATA_FINAL[gameState.currentQIndex];
+            const cleanUserAnswer = cleanAnswer(userAnswer);
+            const cleanCorrectAnswer = cleanAnswer(currentQ.answer);
+
+            // Tolérance : Max 2 fautes ou 20% de la longueur de la réponse (pour les longues réponses)
+            const maxEditDistance = Math.max(1, Math.min(2, Math.ceil(cleanCorrectAnswer.length * 0.2))); 
+            const distance = getEditDistance(cleanUserAnswer, cleanCorrectAnswer);
+
+            const isCorrect = distance <= maxEditDistance;
+            let pointsAwarded = 0;
+            let feedbackTitle = "";
+            let feedbackClass = "";
+            let feedbackMessage = "";
+
+            // Logique de score spéciale pour "Cascades"
+            if (currentQ.section === "Cascades (A-Z)") {
+                const requiredLetter = currentQ.requiredLetter.toUpperCase();
+                const userFirstLetter = cleanUserAnswer.charAt(0).toUpperCase();
+                const startsWithCorrectLetter = userFirstLetter === requiredLetter;
+
+                if (isCorrect && startsWithCorrectLetter) {
+                    pointsAwarded = currentQ.points; // +20
+                    feedbackTitle = "CASCADE RÉUSSIE !";
+                    feedbackClass = "correct-feedback";
+                    feedbackMessage = `Excellent ! La réponse <strong>${currentQ.answer}</strong> commence bien par ${requiredLetter}. <br>Vous gagnez ${pointsAwarded} points.`;
+                } else {
+                    pointsAwarded = -10; // Pénalité
+                    feedbackTitle = "PÉNALITÉ (-10 PTS)";
+                    feedbackClass = "incorrect-feedback";
+                    if (isCorrect && !startsWithCorrectLetter) {
+                        feedbackMessage = `La réponse <strong>${currentQ.answer}</strong> est correcte, mais elle ne commence pas par ${requiredLetter}.`;
+                    } else if (!isCorrect && startsWithCorrectLetter) {
+                        feedbackMessage = `La réponse commence bien par ${requiredLetter}, mais elle est incorrecte. <br>La bonne réponse était : <strong>${currentQ.answer}</strong>.`;
+                    } else {
+                        feedbackMessage = `Réponse incorrecte. La bonne réponse était : <strong>${currentQ.answer}</strong> (devait commencer par ${requiredLetter}).`;
+                    }
+                }
+            } else {
+                // Logique normale pour les autres sections
+                if (isCorrect) {
+                    pointsAwarded = currentQ.points;
+                    feedbackTitle = "CORRECT !";
+                    feedbackClass = "correct-feedback";
+                    feedbackMessage = `${isTimedOut ? "Temps écoulé. " : ""} ${isCorrect ? `Tolérance acceptée (Distance: ${distance}). Vous gagnez ${pointsAwarded} points.` : 'Pas de point.'} <br>La bonne réponse était : <strong>${currentQ.answer}</strong>.`;
+                } else {
+                    pointsAwarded = 0;
+                    feedbackTitle = "INCORRECT !";
+                    feedbackClass = "incorrect-feedback";
+                    feedbackMessage = `${isTimedOut ? "Temps écoulé. " : ""} ${isCorrect ? `Tolérance acceptée (Distance: ${distance}). Vous gagnez ${pointsAwarded} points.` : 'Pas de point.'} <br>La bonne réponse était : <strong>${currentQ.answer}</strong>.`;
+                }
+            }
+            
+            gameState.currentScore += pointsAwarded;
+
+            // Enregistrer la réponse pour le récapitulatif
+            gameState.userAnswers.push({
+                index: gameState.currentQIndex + 1,
+                question: currentQ.question,
+                correctAnswer: currentQ.answer,
+                userAnswer: userAnswer.trim() || 'N/A (Temps écoulé)',
+                points: currentQ.points,
+                pointsAwarded: pointsAwarded,
+                isCorrect: isCorrect,
+                section: currentQ.section
+            });
+
+            // Si ce n'est pas une cascade, définir les messages de feedback standards (s'ils n'ont pas été définis par la logique normale)
+            if (currentQ.section !== "Cascades (A-Z)") {
+                if (!isCorrect && !isTimedOut) {
+                    feedbackMessage += `<br><span class="text-sm text-gray-200">Distance d'édition: ${distance} (Max toléré: ${maxEditDistance})</span>`;
+                }
+            }
+            
+            // Vérification de la fin de rubrique avant de passer à la question suivante
+            const checkNextStep = () => {
+                gameState.currentQIndex++;
+
+                if (gameState.currentQIndex < QUIZ_DATA_FINAL.length) {
+                    
+                    const currentSection = QUIZ_DATA_FINAL[gameState.currentQIndex - 1].section;
+                    const nextQ = QUIZ_DATA_FINAL[gameState.currentQIndex];
+                    
+                    // Vérification du changement de rubrique
+                    if (nextQ && nextQ.section !== currentSection) {
+                        showModal(
+                            "Rubrique Terminée ! 🎉",
+                            `Vous avez complété la rubrique : <strong>${currentSection}</strong>.<br>Préparez-vous pour la prochaine : <strong>${nextQ.section}</strong> !`,
+                            startQuestion // Appel à startQuestion après la fermeture de la modale
+                        );
+                    } else {
+                        startQuestion();
+                    }
+                } else {
+                    async function endQuiz() {
+                      try {
+                        await saveScoreLocal(); // toujours en local
+                      } catch (e) {
+                        console.error('Local save failed:', e);
+                      }
+
+                      // Tentative de sauvegarde distante (si prêt et en ligne)
+                      if (navigator.onLine && gameState.isAuthReady && gameState.currentScore > 0) {
+                        try {
+                          const userRef = doc(getPublicScoresCollectionRef(), gameState.userId);
+                          await setDoc(userRef, {
+                            id: gameState.userId,
+                            name: `${gameState.userFirstName} ${gameState.userName}`.trim(),
+                            score: gameState.currentScore,
+                            timestamp: serverTimestamp(),
+                          }, { merge: true });
+                          console.log('Score Firestore OK');
+                        } catch (e) {
+                          console.error('Firestore save failed, enqueue for later:', e);
+                          // Quoi qu'il arrive, stocké en file d'attente pour future sync
+                          await idbPut('syncQueue', {
+                            id: (typeof crypto !== 'undefined' ? crypto.randomUUID() : 'sync-' + Date.now()),
+                            userId: gameState.userId,
+                            name: `${gameState.userFirstName} ${gameState.userName}`.trim(),
+                            score: gameState.currentScore,
+                            timestamp: Date.now()
+                          });
+                        }
+                      }
+
+                      gameState.view = 'results';
+                      renderApp();
+                    }
+
+                                    }
+                                };
+            
+            // Mise à jour visuelle du conteneur de question
+            const questionContainer = document.getElementById('question-container');
+            if (questionContainer) {
+                questionContainer.innerHTML = `<div class="p-8 text-white rounded-xl ${feedbackClass} transition-all duration-300">
+                    <h3 class="text-3xl font-extrabold mb-4">${feedbackTitle}</h3>
+                    <p class="text-xl">${feedbackMessage}</p>
+                </div>`;
+            }
+            
+            document.getElementById('submit-button')?.classList.add('hidden');
+            document.getElementById('answer-input')?.setAttribute('disabled', 'true');
+
+            // Passer à la question suivante après 3 secondes
+            quizTimerTimeout = setTimeout(checkNextStep, 3000); 
+        }
+
+        function startQuestion() {
+            const currentQ = QUIZ_DATA_FINAL[gameState.currentQIndex];
+            renderQuizView(currentQ);
+            
+            // Le timer est démarré si la partie n'est pas en pause
+            if (!gameState.isPaused) {
+                startTimer();
+                setTimeout(() => document.getElementById('answer-input')?.focus(), 0);
+            }
+        }
+
+        function endQuiz() {
+            saveScore();
+            gameState.view = 'results';
+            renderApp();
+        }
+        
+        // --- Rendu des Vues ---
+
+        function renderLoginView() {
+            appContainer.innerHTML = `
+                <div class="quiz-card p-8 rounded-xl shadow-2xl w-full max-w-md mx-auto">
+                    <h2 class="text-3xl font-bold mb-6 text-white text-center">Woezon</h2>
+                    <p class="text-gray-400 mb-6 text-center">Veuillez entrer vos informations pour commencer la compétition et enregistrer votre score.</p>
+                    <div class="space-y-4">
+                        <input id="firstname-input" type="text" placeholder="Votre Prénom" class="w-full p-3 rounded-lg bg-gray-700 text-white border-none focus:ring-2 focus:ring-blue-500" value="${gameState.userFirstName}">
+                        <input id="name-input" type="text" placeholder="Votre Nom" class="w-full p-3 rounded-lg bg-gray-700 text-white border-none focus:ring-2 focus:ring-blue-500" value="${gameState.userName}">
+                    </div>
+                    <button id="start-button" class="mt-8 w-full py-3 rounded-lg font-bold text-xl text-white bg-green-600 hover:bg-green-700 transition duration-150 shadow-lg">
+                        Démarrer le Match
+                    </button>
+                    <p class="text-xs text-gray-500 mt-4 text-center">ID Joueur : ${gameState.userId}</p>
+                    ${!gameState.isAuthReady ? '<p class="text-red-500 mt-4 text-sm text-center">Mode Hors Ligne : Le classement ne sera pas sauvegardé.</p>' : ''}
+                </div>
+                ${renderLeaderboard()}
+            `;
+            document.getElementById('start-button').onclick = startQuiz;
+        }
+
+        function renderQuizView(q) {
+            appContainer.innerHTML = `
+                ${gameState.isPaused ? 
+                    `<div id="pause-overlay" class="pause-overlay fixed inset-0 flex items-center justify-center z-40 bg-black bg-opacity-75">
+                        <div class="p-10 text-center quiz-card rounded-xl shadow-2xl">
+                            <h3 class="text-4xl font-extrabold text-blue-400 mb-6">PAUSE</h3>
+                            <button id="resume-button" class="py-3 px-8 rounded-lg font-bold text-white bg-green-600 hover:bg-green-700 transition duration-150 shadow-lg">
+                                Reprendre la Partie
+                            </button>
+                        </div>
+                    </div>` : ''
+                }
+                <div class="flex flex-col md:flex-row gap-8 relative ${gameState.isPaused ? 'opacity-20 pointer-events-none' : ''}">
+                    <!-- Zone de Quiz (à gauche) -->
+                    <div class="md:w-3/4 flex flex-col space-y-6">
+                        <div class="quiz-card p-4 rounded-xl flex justify-between items-center shadow-lg">
+                            <div class="text-xl font-semibold">
+                                Question <span id="q-number">${gameState.currentQIndex + 1}</span> sur ${QUIZ_DATA_FINAL.length}
+                            </div>
+                            <div class="text-2xl font-bold text-yellow-400">
+                                Score : <span id="score-display">${gameState.currentScore}</span> Pts
+                            </div>
+                        </div>
+
+                        <div id="question-container" class="quiz-card p-6 md:p-8 rounded-xl shadow-xl min-h-[250px] flex flex-col justify-center">
+                            <p class="text-lg text-blue-400 font-medium mb-3">
+                                Rubrique : ${q.section} (Valeur : ${q.points} points)
+                                ${q.requiredLetter ? `<span class="ml-2 px-3 py-1 bg-red-600 text-white text-sm font-bold rounded-full">LETTRE : ${q.requiredLetter}</span>` : ''}
+                            </p>
+                            <p class="text-2xl md:text-3xl font-semibold text-white">
+                                <span class="text-yellow-400 mr-2">${gameState.currentQIndex + 1}.</span> ${q.question}
+                            </p>
+                        </div>
+                        
+                        <div class="mt-4 flex flex-col md:flex-row gap-4">
+                            <input id="answer-input" type="text" placeholder="Votre réponse..." class="w-full p-4 rounded-lg bg-gray-700 text-white border-none text-xl focus:ring-4 focus:ring-blue-500 transition" autocomplete="off">
+                            <button id="submit-button" class="py-4 px-6 rounded-lg font-bold text-white bg-blue-600 hover:bg-blue-700 transition duration-150 flex-shrink-0">
+                                Valider
+                            </button>
+                        </div>
+                    </div>
+
+                    <!-- Chronomètre & Contrôles (à droite) -->
+                    <div class="md:w-1/4 flex flex-col items-center justify-start py-4 space-y-4">
+                        <div id="timer-ring" class="relative w-40 h-40 flex items-center justify-center rounded-full border-4 border-red-500/50">
+                            <div class="absolute inset-0 flex items-center justify-center">
+                                <span id="timer-display" class="text-6xl font-extrabold text-red-500">${gameState.timer}</span>
+                            </div>
+                            <div class="absolute bottom-4 text-red-500 font-semibold">SECONDES</div>
+                        </div>
+                        <div class="flex flex-col space-y-2 w-full max-w-[160px]">
+                            <button id="pause-button" class="py-2 px-4 rounded-lg font-semibold text-white bg-yellow-600 hover:bg-yellow-700 transition duration-150">
+                                Pause
+                            </button>
+                            <button id="abandon-button" class="py-2 px-4 rounded-lg font-semibold text-white bg-red-600 hover:bg-red-700 transition duration-150">
+                                Abandonner
+                            </button>
+                            <button id="skip-button" class="py-2 px-4 rounded-lg font-semibold text-white bg-green-500 hover:bg-green-600 transition duration-150 mt-2">
+                                Passer
+                            </button>
+
+                        </div>
+                    </div>
+                </div>
+            `;
+            
+            if (gameState.isPaused) {
+                document.getElementById('resume-button').onclick = pauseQuiz;
+            } else {
+                document.getElementById('submit-button').onclick = () => {
+                    const answer = document.getElementById('answer-input').value;
+                    if (answer.trim()) {
+                        processAnswer(answer);
+                    } else {
+                        showModal("Réponse Requise", "Veuillez entrer une réponse avant de valider.");
+                    }
+                };
+            }
+            document.getElementById('pause-button').onclick = pauseQuiz;
+            document.getElementById('abandon-button').onclick = abandonQuiz;
+            document.getElementById('skip-button').onclick = () => {
+                gameState.userAnswers.push({
+                    index: gameState.currentQIndex + 1,
+                    question: q.question,
+                    correctAnswer: q.answer,
+                    userAnswer: 'Passée',
+                    points: q.points,
+                    pointsAwarded: 0,
+                    isCorrect: false,
+                    section: q.section
+                });
+                clearInterval(gameState.timerInterval);
+                clearTimeout(quizTimerTimeout);
+                gameState.currentQIndex++;
+                if (gameState.currentQIndex < QUIZ_DATA_FINAL.length) {
+                    startQuestion();
+                } else {
+                    endQuiz();
+                }
+            };
+
+        }
+
+        function renderResultsView() {
+            appContainer.innerHTML = `
+                <div class="quiz-card p-10 rounded-xl shadow-2xl w-full mx-auto text-center mb-8">
+                    <h2 class="text-5xl font-extrabold text-green-400 mb-4">Match Terminé !</h2>
+                    <p class="text-3xl text-white mb-6">Félicitations, ${gameState.userFirstName} !</p>
+                    <p class="text-6xl font-black text-yellow-400">${gameState.currentScore}</p>
+                    <p class="text-2xl text-gray-300">Points Totaux</p>
+                    <div class="flex justify-center space-x-4 mt-8">
+                        <button id="summary-button" class="py-3 px-8 rounded-lg font-bold text-white bg-purple-600 hover:bg-purple-700 transition duration-150 shadow-lg">
+                            Voir le Récapitulatif
+                        </button>
+                        <button id="restart-button" class="py-3 px-8 rounded-lg font-bold text-white bg-blue-600 hover:bg-blue-700 transition duration-150 shadow-lg">
+                            Retour à l'Accueil
+                        </button>
+                    </div>
+                </div>
+                ${renderLeaderboard()}
+            `;
+            document.getElementById('restart-button').onclick = () => {
+                gameState.view = 'login';
+                renderApp();
+            };
+            document.getElementById('summary-button').onclick = () => {
+                gameState.view = 'summary';
+                renderApp();
+            };
+        }
+
+        function renderSummaryView() {
+            const summaryList = gameState.userAnswers.map(ans => {
+                const answerClass = ans.isCorrect ? 'summary-correct' : 'summary-incorrect';
+                const icon = ans.isCorrect ? '✅' : '❌';
+                return `
+                    <div class="border-b border-gray-700 py-4">
+                        <p class="text-lg font-semibold mb-2">
+                            <span class="text-blue-400">${ans.index}.</span> [${ans.section}] (${ans.pointsAwarded}/${ans.points} Pts)
+                        </p>
+                        <p class="mb-1 text-white">
+                            <span class="font-bold">Question :</span> ${ans.question}
+                        </p>
+                        <p class="mb-1">
+                            <span class="font-bold text-gray-400">Votre Réponse :</span> 
+                            <span class="${answerClass}">${ans.userAnswer} ${icon}</span>
+                        </p>
+                        <p class="mb-1 text-green-500">
+                            <span class="font-bold">Bonne Réponse :</span> ${ans.correctAnswer}
+                        </p>
+                    </div>
+                `;
+            }).join('');
+
+            appContainer.innerHTML = `
+                <div class="quiz-card p-8 rounded-xl shadow-2xl w-full mx-auto text-center mb-8">
+                    <h2 class="text-4xl font-extrabold text-purple-400 mb-2">Récapitulatif de la Partie</h2>
+                    <p class="text-2xl text-white mb-6">Score Final: <span class="text-yellow-400 font-bold">${gameState.currentScore} Pts</span></p>
+                    <button id="back-to-results-button" class="py-2 px-6 rounded-lg font-bold text-white bg-blue-600 hover:bg-blue-700 transition duration-150 shadow-lg">
+                        Retour aux Résultats
+                    </button>
+                </div>
+                <div class="quiz-card p-8 rounded-xl shadow-2xl w-full mx-auto mt-6">
+                    ${summaryList.length > 0 ? summaryList : '<p class="text-center text-gray-500">Aucune question enregistrée.</p>'}
+                </div>
+            `;
+            document.getElementById('back-to-results-button').onclick = () => {
+                gameState.view = 'results';
+                renderApp();
+            };
+        }
+
+        async function getRemoteLeaderboard(max = 10) {
+          if (!gameState.isAuthReady) return [];
+          const q = query(getPublicScoresCollectionRef(), orderBy('score', 'desc'), limit(max));
+          const snap = await getDocs(q);
+          const arr = [];
+          snap.forEach(docu => {
+              const d = docu.data();
+              arr.push({
+              userId: d.id,
+              name: d.name,
+              score: d.score,
+              timestamp: (d.timestamp?.seconds ? d.timestamp.seconds * 1000 : Date.now())
+              });
+          });
+          return arr;
+          }
+
+          async function getCombinedLeaderboard(max = 10) {
+          const local = await getLocalLeaderboard(max);
+          if (navigator.onLine && gameState.isAuthReady) {
+              const remote = await getRemoteLeaderboard(max);
+              const map = new Map();
+              for (const r of remote) map.set(r.userId, r);
+              for (const l of local) {
+              const existing = map.get(l.userId);
+              if (!existing || l.score > existing.score) {
+                  map.set(l.userId, l);
+              }
+              }
+              return Array.from(map.values())
+              .sort((a,b) => b.score - a.score || (b.timestamp - a.timestamp))
+              .slice(0, max);
+          } else {
+              return local;
+          }
+          }
+
+          function renderLeaderboardSection(items) {
+          const listItems = items.map((item, index) => `
+              <li class="flex justify-between items-center py-3 px-4 rounded-lg ${index < 3 ? 'bg-yellow-900/50 border-l-4 border-yellow-400' : 'bg-gray-800'} ${item.userId === gameState.userId ? 'ring-2 ring-blue-500' : ''}">
+              <span class="font-bold w-10 text-center">${index + 1}</span>
+              <span class="flex-grow text-left">${item.name || '(Anonyme)'} <span class="text-xs text-gray-500">ID: ${(item.userId || '').substring(0, 8)}...</span> ${item.userId === gameState.userId ? '(Vous)' : ''}</span>
+              <span class="font-extrabold text-yellow-300">${item.score} Pts</span>
+              </li>
+          `).join('');
+          return `
+              <div class="mt-10 p-6 quiz-card rounded-xl shadow-2xl w-full">
+              <h2 class="text-3xl font-bold mb-6 text-white text-center">Classement des Génies (Top 10)</h2>
+              <ul class="space-y-2 text-lg">
+                  ${listItems.length > 0 ? listItems : '<p class="text-center text-gray-500">Aucun score enregistré pour l\'instant.</p>'}
+              </ul>
+              ${(!navigator.onLine || !gameState.isAuthReady) ? '<p class="mt-3 text-center text-sm text-gray-400">(Mode hors ligne ou Firestore indisponible: classement local)</p>' : ''}
+              </div>
+          `;
+          }
+
+          async function renderLeaderboard() {
+    const top10 = await getTop10Scores();
+
+    const listItems = top10.map((item, index) => `
+        <li class="flex justify-between items-center py-3 px-4 rounded-lg 
+            ${index < 3 ? 'bg-yellow-900/50 border-l-4 border-yellow-400' : 'bg-gray-800'} 
+            ${item.id === gameState.userId ? 'ring-2 ring-blue-500' : ''}">
+            <span class="font-bold w-10 text-center">${index + 1}</span>
+            <span class="flex-grow text-left">${item.name} <span class="text-xs text-gray-500">(ID: ${item.id.substring(0, 8)}...)</span></span>
+            <span class="font-extrabold text-yellow-300">${item.score} Pts</span>
+        </li>
+    `).join('');
+
+    return `
+        <div class="mt-10 p-6 quiz-card rounded-xl shadow-2xl w-full">
+            <h2 class="text-3xl font-bold mb-6 text-white text-center">Classement des Génies (Top 10)</h2>
+            <ul class="space-y-2 text-lg">
+                ${listItems.length > 0 ? listItems : '<p class="text-center text-gray-500">Aucun score enregistré pour l\'instant.</p>'}
+            </ul>
+        </div>
+    `;
+}
+
+
+
+        function renderApp() {
+            if (gameState.view !== 'quiz') {
+                // S'assurer que les intervalles sont effacés si on quitte la vue quiz
+                clearInterval(gameState.timerInterval);
+                clearTimeout(quizTimerTimeout);
+            }
+            
+            switch (gameState.view) {
+                case 'login':
+                    renderLoginView();
+                    break;
+                case 'quiz':
+                    // On appelle startQuestion/renderQuizView qui gère la pause
+                    const currentQ = QUIZ_DATA_FINAL[gameState.currentQIndex];
+                    if (currentQ) {
+                         renderQuizView(currentQ);
+                    }
+                    break;
+                case 'results':
+                    renderResultsView();
+                    break;
+                case 'summary':
+                    renderSummaryView();
+                    break;
+            }
+        }
+
+        // --- Initialisation ---
+        window.onload = async () => {
+        // ID joueur déterministe si non authentifié
+        gameState.userId = gameState.userId || (typeof crypto !== 'undefined' ? crypto.randomUUID() : 'anonymous-' + Math.random().toString(36).substring(2, 9));
+
+        if (firebaseConfig) {
+          await initFirebase();
+        } else {
+          console.warn("Firebase config not found. Running in local mode.");
+          gameState.isAuthReady = false;
+        }
+        renderApp();
+      };
+
+
+    </script>

@@ -1,0 +1,1165 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Match de Génie en Herbe</title>
+    <!-- Tailwind CSS CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+
+    <script src="idb.js"></script>
+
+    <!-- Font Inter (Pour un look moderne) -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&display=swap" rel="stylesheet">
+    <style>
+        body { font-family: 'Inter', sans-serif; background-color: #0d1117; color: #c9d1d9; }
+        .quiz-card { background-color: #161b22; border: 1px solid #30363d; }
+        .timer-ring { animation: pulse-red 1.5s infinite; }
+        @keyframes pulse-red { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+        .correct-feedback { background-color: #238636; border-color: #3f6e4a; }
+        .incorrect-feedback { background-color: #da3633; border-color: #8c3b3b; }
+        .loading-ring { border-top-color: #58a6ff; animation: spin 1s linear infinite; }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+        /* Style pour la surbrillance des réponses justes/fausses dans le récapitulatif */
+        .summary-correct { color: #238636; font-weight: 700; }
+        .summary-incorrect { color: #da3633; font-weight: 700; }
+        .pause-overlay { backdrop-filter: blur(8px); }
+    </style>
+</head>
+<body class="p-4 md:p-8 min-h-screen flex flex-col items-center justify-center">
+
+    <h1 class="text-4xl md:text-5xl font-extrabold mb-8 text-white text-center">
+        Match de Génie en Herbe
+    </h1>
+
+    <main id="app-container" class="w-full max-w-4xl">
+        <!-- Contenu de l'application rendu par JavaScript -->
+    </main>
+    
+    <!-- Modal pour les messages et le feedback -->
+    <div id="modal" class="fixed inset-0 bg-black bg-opacity-75 hidden items-center justify-center z-50">
+        <div id="modal-content" class="p-6 rounded-lg shadow-2xl w-11/12 max-w-lg text-center quiz-card">
+            <h2 id="modal-title" class="text-2xl font-bold mb-4"></h2>
+            <p id="modal-message" class="mb-6 text-lg"></p>
+            <div class="flex justify-center space-x-4">
+                <button id="modal-button" class="px-6 py-2 rounded-lg font-semibold text-white bg-blue-600 hover:bg-blue-700 transition duration-150">Continuer</button>
+                <button id="modal-cancel-button" class="hidden px-6 py-2 rounded-lg font-semibold text-white bg-gray-600 hover:bg-gray-700 transition duration-150">Annuler</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Firebase Imports -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, collection, query, orderBy, onSnapshot, doc, setDoc, getDocs, limit, serverTimestamp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        
+        // setLogLevel('Debug'); // Décommenter pour le débogage de Firestore
+
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : null;
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-quiz-app';
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+        let app, db, auth;
+        let gameState = {
+            view: 'login', // 'login', 'quiz', 'results', 'summary'
+            userName: '',
+            userFirstName: '',
+            userId: null,
+            currentScore: 0,
+            currentQIndex: 0,
+            timer: 0, // Temps restant
+            initialTimer: 15, // Temps initial pour la question actuelle
+            timerInterval: null,
+            leaderboard: [],
+            isAuthReady: false,
+            isPaused: false,
+            userAnswers: [], // Pour stocker { question, correctAnswer, userAnswer, points, isCorrect }
+        };
+
+        // --- IndexedDB integration for scores (local leaderboard) ---
+
+        async function saveScoreLocal() {
+          if (!gameState.userId) {
+            gameState.userId = (typeof crypto !== 'undefined' ? crypto.randomUUID() : 'anonymous-' + Math.random().toString(36).substring(2,9));
+          }
+          const entry = {
+            id: (typeof crypto !== 'undefined' ? crypto.randomUUID() : 'score-' + Date.now()),
+            userId: gameState.userId,
+            name: `${gameState.userFirstName} ${gameState.userName}`.trim() || '(Sans nom)',
+            score: gameState.currentScore,
+            timestamp: Date.now()
+          };
+          try {
+            await idbPut('scores', entry); // fournie par idb.js
+          } catch (e) {
+            console.error('IDB save error:', e);
+          }
+          // Si hors ligne ou Firestore non prêt → file d’attente pour sync
+          if (!navigator.onLine || !gameState.isAuthReady) {
+            try {
+              await idbPut('syncQueue', entry);
+            } catch (e) {
+              console.error('IDB enqueue error:', e);
+            }
+          }
+        }
+
+        // Retourne top N local (meilleur score par userId)
+        async function getLocalLeaderboard(limitCount = 10) {
+          const scores = await idbGetAll('scores');
+          const bestByUser = new Map();
+          for (const s of scores) {
+            const prev = bestByUser.get(s.userId);
+            if (!prev || s.score > prev.score) bestByUser.set(s.userId, s);
+          }
+          return Array.from(bestByUser.values())
+            .sort((a,b) => b.score - a.score || (b.timestamp - a.timestamp))
+            .slice(0, limitCount);
+        }
+
+        window.addEventListener('online', async () => {
+          console.info('Connexion retrouvée — synchronisation des scores en file…');
+          if (firebaseConfig && !gameState.isAuthReady) {
+            await initFirebase(); // ta fonction existante
+          }
+          // Pousser la file d’attente vers Firestore
+          try {
+            const pending = await idbGetAll('syncQueue');
+            for (const entry of pending) {
+              try {
+                const userRef = doc(getPublicScoresCollectionRef(), entry.userId);
+                await setDoc(userRef, {
+                  id: entry.userId,
+                  name: entry.name,
+                  score: entry.score,
+                  timestamp: serverTimestamp()
+                }, { merge: true });
+                await idbDelete('syncQueue', entry.id);
+              } catch (e) {
+                console.error('Sync error for entry', entry.id, e);
+              }
+            }
+          } catch (e) {
+            console.error('SyncQueue read error:', e);
+          }
+          // Rafraîchir l’UI
+          renderApp();
+        });
+
+        window.addEventListener('offline', () => {
+          console.info('Mode hors ligne — classement local uniquement');
+        });
+
+
+        // Données originales groupées par rubrique et dans l'ordre souhaité
+        const RAW_QUIZ_DATA = {
+            "Duel des capitaines": [
+                { points: 20, question: "Écrivain britannique d'origine indienne, j'ai écrit une œuvre qui a suscité de profonds remous dans le monde m'obligeant à me cacher pour échapper à des menaces de mort, notamment une fatwa émise par l'Ayatollah Khamenei en personne. Quel est le nom de cette œuvre ? Je précise que je m'appelle Salman Rushdie.", answer: "Les versets sataniques" },
+                { points: 20, question: "Dans quel pays peut-on visiter Man, Daloa, Gagnoa et Korhogo ?", "answer": "la Côte d'Ivoire" },
+                { points: 20, question: "Médecin et criminaliste italien né en 1835 et mort en 1909, il est l'un des fondateurs de la criminologie moderne. Il développa la théorie du criminel-né. Comment s'appelle-t-il ?", answer: "Cesare LOMBROSO" },
+                { points: 20, question: "Quel nom masculin invariable, d'origine latine signifie 'aveu' ou 'repentir d'une faute commise' ?", answer: "Mea-culpa" },
+                { points: 20, question: "Définissez l'acronyme SONAR ?", answer: "Sound Navigation Ranging" },
+                { points: 20, question: "Dans quel pays une femme devient pour la première fois bachelière le 17 Aout 1861 ?", answer: "France" },
+                { points: 20, question: "Comment appelle-t-on encore l'étude des sceaux ?", answer: "la sigillographie" },
+                { points: 20, question: "En quelle année Karl Wilhelm Roentgen reçut-il le Prix Nobel de Physique pour sa découverte des rayons X ?", answer: "1901" },
+                { points: 20, question: "En Iran, le refus du port de quel accessoire vestimentaire par les femmes est puni de 70 coups de fouets et de 60 jours d'emprisonnement ?", answer: "Hijab" },
+                { points: 20, question: "Comment appelle-t-on une tour élevée portant au sommet une puissante source lumineuse destinée à guider les navires durant la nuit ?", answer: "Phare" },
+                { points: 20, question: "Quel adjectif désigne tout ce qui est relatif à la navigation ou aux sports de l'eau ?", answer: "Nautique" },
+                { points: 20, question: "Sur la place de marché de quelle ville a été brulée vive Jeanne d'Arc ?", answer: "Rouen" },
+                { points: 20, question: "Qui reçut le 1er Prix Nobel de Littérature ?", answer: "René Sully PRUDHOMME" },
+                { points: 20, question: "Quel nom d'un singe d'Asie sert aussi à désigner une personne très laide ?", answer: "Macaque" },
+                { points: 20, question: "Quel est l'indicatif téléphonique de la Guinée-Conakry ?", answer: "224" },
+                { points: 20, question: "Dans quel sport utilise-t-on une boule de 68,5 cm de circonférence et d'un poids maximal de 7,26 kg ?", answer: "Bowling" },
+                { points: 20, question: "Quel était le nom de code de l'opération qui a permis de tuer l'ancien ennemi numéro un des Etats-Unis et chef d'Al Qaida Oussama Ben Laden ?", answer: "Geronimo" },
+                { points: 20, question: "Au cours d'un procès, comment appelle-t-on le discours de l'accusation ?", answer: "Le réquisitoire" },
+                { points: 20, question: "En géographie comment appelle-t-on dans les pays tropicaux, une dépression de terrain inondée pendant la saison des pluies, ou bras mort d'un fleuve ?", answer: "Marigot" },
+                { points: 20, question: "Qui reçut le Ballon d'or France Football en 2008 et en 2013 ?", answer: "Cristiano Ronaldo" }
+            ],
+            // ** Première série d'Éclairs (remplacée par l'utilisateur lors de la première requête) **
+            "Éclairs (Série 1)": [ 
+                { points : 10, question : "Mesurant 828m de haut et se trouvant à Dubaï, c'est la plus haute tour du monde. Elle se nomme Burj-Khalifa. Combien d'étages fait-elle exactement ?", answer: "164 étages" },
+                { points : 10, question : "En médecine comment appelle-t-on cette maladie due à un manque de vitamine B1 et qui se traduit par un œdème du corps et un engourdissement et une faiblesse des jambes?", answer: "Béri-béri" },
+                { points : 10, question : "Quelle couleur est intermédiaire entre le blanc et le noir ?", answer: "Gris" },
+                { points : 10, question : "Comment appelle-t-on l'angoisse ou la peur que l'on ressent juste avant de se produire en public ou de mettre un projet à exécution ?", answer: "le trac" },
+                { points : 10, question : "Quelle ville du Japon sur l'île de Honshu a donné son nom à son industrie automobile qui est l'une des grandes du marché mondial ?", answer: "Toyota" },
+                { points : 10, question : "Etoile massive ayant atteint un stade avancé de son évolution, qui explose et se manifeste temporairement par un éclat beaucoup plus élevé ?", answer: "Supernova" },
+                { points : 10, question : "Femme de lettres française, disciple et compagne de J-P SARTRE, ardente féministe, elle est l'auteur de romans et d'essais comme Les Mandarins, Le deuxième sexe. De qui parle-t-on ?", answer: "Simone de Beauvoir" },
+                { points : 10, question : "Nichée à près de 3 812 mètres d’altitude, à la frontière entre le Pérou et la Bolivie, quel est le plus haut lac navigable du monde ?", answer: "Le lac Titicaca" },
+                { points : 10, question : "Dans la culture islamique traditionnelle, quel nom donne-t-on à l’espace privé, généralement réservé aux épouses, concubines et femmes de la famille, au sein d’un palais ou d’une demeure ?", answer: "Le harem" },
+                { points : 10, question : "En philosophie, comment appelle-t-on le processus visant à faire découvrir à l’interlocuteur, par une série de questions, les vérités qu’il possède en lui ?", answer: "La Maïeutique" },
+               ],
+            "Lettre du match (M)": [
+                { points : 10, question : "Comment appelle-t-on en médecine le flux périodique chez la femme de liquide sanglant et que l'on désigne souvent par des règles ?", answer: "les menstrues" },
+                { points : 10, question : "Quelle échelle, mise au point au XIXᵉ siècle, permet de classer les minéraux et roches selon leur dureté, du plus tendre au plus résistant ?", answer: "Échelle de Mohs" },
+                { points : 10, question : "Dérivé de l'espagnol 'vagabond' comment se nomment les chevaux sauvages d'Amérique du Nord ?", answer: "Mustang" },
+                { points : 10, question : "Dans quel pays trouve-ton le Pays Dogon et les falaises de Bandiagara ?", answer: "Mali" },
+                { points : 10, question : "Quel métal est à la base de tout alliage nommé amalgame ?", answer: "Le mercure" },
+                { points : 10, question : "Quel cycliste belge était surnommé Le Cannibale ?", answer: "Eddie Merckx" },
+                { points : 10, question : "Quel adjectif signifie qui a l'apparence du marbre ?", answer: "marmoréen" },
+                { points : 10, question : "Quel est le métier des 7 nains qui hébergent Blanche-Neige ?", answer: "mineurs" },
+                { points : 10, question : "Quel personnage biblique eut son fils à 187 ans et vécut jusqu'à 969 ans ?", answer: "Mathusalem" },
+                { points : 10, question : "Quel oiseau marin de l'hémisphère austral peut être royal ou gorfou ?", answer: "Manchot" },
+            ],
+            "Spécialités : Histoire)": [ // Ordre des questions strict
+                { points : 10, question : "Quel président américain a signé la proclamation d’émancipation des esclaves en 1863 ?", answer: "Abraham Lincoln" },
+                { points : 10, question : "Qui fut le premier empereur romain, initiateur du Principat et fondateur de l’Empire romain ?", answer: "Auguste" },
+                { points : 10, question : "Quelle bataille de 1066 a permis à Guillaume le Conquérant de devenir roi d’Angleterre ?", answer: "La bataille d’Hastings" },
+                { points : 10, question : "Quel explorateur portugais a contourné l’Afrique pour atteindre l’Inde en 1498 ?", answer: "Vasco de Gama" },
+                { points : 10, question : "Quel mur, symbole de la guerre froide, a séparé Berlin-Ouest et Berlin-Est de 1961 à 1989 ?", answer: "Le mur de Berlin" },
+            ],
+            "Spécialités : Géographie": [ // Ordre des questions strict
+                { points : 10, question : "Quel pays possède le plus grand nombre de fuseaux horaires, en comptant ses territoires d’outre-mer ?", answer: "La France" },
+                { points : 10, question : "Quel désert, situé en Asie centrale, est le plus vaste en superficie après le Sahara ?", answer: "Le désert de Gobi" },
+                { points : 10, question : "Quel lac africain est le plus profond et se situe dans la vallée du Rift ?", answer: "Le lac Tanganyika" },
+                { points : 10, question : "Quel pays africain possède la plus longue façade maritime sur l’océan Atlantique ?", answer: "L’Angola" },
+                { points : 10, question : "Quel est le plus grand pays enclavé du monde ?", answer: "Le Kazakhstan" },
+            ],
+            // ** NOUVELLES RUBRIQUES CI-DESSOUS **
+            "Spécialités : Art et littérature": [
+                { points: 10, question: "Quel peintre espagnol est célèbre pour son tableau « Guernica », dénonçant les horreurs de la guerre ?", answer: "Pablo Picasso" },
+                { points: 10, question: "Quel poète français du XIXe siècle a écrit « Les Fleurs du Mal » ?", answer: "Charles Baudelaire" },
+                { points: 10, question: "Quel sculpteur italien est l’auteur de la statue de « David » et du plafond de la Chapelle Sixtine ?", answer: "Michel-Ange" },
+                { points: 10, question: "Quel écrivain russe a écrit « Guerre et Paix », un roman épique sur l’invasion de la Russie par Napoléon ?", answer: "Léon Tolstoï" },
+                { points: 10, question: "Quel mouvement artistique du début du XXe siècle est associé à Salvador Dalí et René Magritte ?", answer: "Le surréalisme" }
+            ],
+            "Spécialités : Sport": [
+                { points: 10, question: "Quel footballeur a inscrit 2 buts de la tête en finale de la Coupe du monde 1998 ?", answer: "Zinédine Zidane" },
+                { points: 10, question: "Sous quel nom est plus connu le footballeur brésilien : Edson Arantes Do Nascimento ?", answer: "Pelé" },
+                { points: 10, question: "En sport, quel anglicisme désigne la photographie de l'arrivée d'une course ?", answer: "La photo-finish" },
+                { points: 10, question: "En octobre 2008, quel ancien footballeur est devenu sélectionneur de l'équipe nationale d'Argentine ?", answer: "Diego Armando Maradona" },
+                { points: 10, question: "De quel club de foot argentin le pape François est-il un fervent supporter ?", answer: "Le club de San Lorenzo de Almagro" }
+            ],
+            "Lettre du match : lettre E": [
+                { points: 10, question: "Quel terme désigne la force ou la capacité qui permet d’accomplir un travail ou de produire un mouvement, qu’il soit physique, électrique ou mental ?", answer: "Énergie" },
+                { points: 10, question: "Quel outil simple permet de relier deux niveaux en hauteur, grâce à des barreaux qu’on gravit un à un ?", answer: "Échelle" },
+                { points: 10, question: "Quel astre, dont notre Soleil est un exemple, brille de sa propre lumière et peuple l’univers par milliards ?", answer: "Étoile" },
+                { points: 10, question: "Quel phénomène sonore se produit lorsqu’un bruit est renvoyé par une surface lointaine, donnant l’impression d’une répétition ?", answer: "Écho" },
+                { points: 10, question: "Quel mot désigne une manifestation violente, spontanée et désorganisée d’un groupe de personnes en colère contre une autorité ou une injustice ?", answer: "Émeute" },
+                { points: 10, question: "Quel sommet, situé dans l’Himalaya à la frontière entre le Népal et la Chine, culmine à 8 848 mètres d’altitude et est considéré comme le plus haut point de la planète Terre ?", answer: "Everest" },
+                { points: 10, question: "Quel terme désigne un ensemble d’activités intellectuelles et manuelles visant à former ou à instruire un individu, depuis l’enfance jusqu’à l’âge adulte ?", answer: "Éducation" },
+                { points: 10, question: "Quelle est la cinquième lettre de l’alphabet français ?", answer: "E" },
+                { points: 10, question: "Quel pays de la Corne de l’Afrique, à l’histoire millénaire, fut l’un des rares États africains à ne jamais avoir été colonisé, et possède une culture chrétienne orthodoxe profondément enracinée ?", answer: "Éthiopie" },
+                { points: 10, question: "Quel objet souple et absorbant, d’origine naturelle ou synthétique, est couramment utilisé pour nettoyer ou absorber des liquides ?", answer: "Éponge" }
+            ],
+            "Thème : Les célèbres auteurs africains": [
+                { points: 10, question: "Quel écrivain nigérian, auteur de Le Monde s’effondre, est considéré comme un oublié du prix Nobel ?", answer: "Chinua Achebe" },
+                { points: 10, question: "Quelle écrivaine sénégalaise, pionnière du féminisme africain francophone, a bouleversé la scène littéraire en 1979 avec son roman épistolaire Une si longue lettre, dans lequel elle dénonce la polygamie et les injustices faites aux femmes ?", answer: "Mariama Bâ" },
+                { points: 10, question: "Quel écrivain ivoirien, célèbre pour avoir donné une voix singulière à l’Afrique postcoloniale en mêlant le français aux rythmes et aux proverbes malinkés, est l’auteur du roman engagé Les Soleils des Indépendances, paru en 1968 ?", answer: "Ahmadou Kourouma" },
+                { points: 10, question: "Quel poète et homme d’État sénégalais, cofondateur de la négritude, a été le premier Africain membre de l’Académie française ?", answer: "Léopold Sédar Senghor" },
+                { points: 10, question: "Quel dramaturge, poète et militant nigérian est devenu en 1986 le premier écrivain africain à recevoir le prix Nobel de littérature ?", answer: "Wole Soyinka" },
+                { points: 10, question: "Quel écrivain camerounais, également diplomate et homme politique, est l’auteur du roman satirique Une vie de boy (1956), dans lequel il dénonce les abus du colonialisme à travers le regard naïf mais lucide d’un jeune domestique africain ?", answer: "Ferdinand Oyono" },
+                { points: 10, question: "Quel écrivain guinéen a marqué les débuts de la littérature africaine francophone en 1953 avec L’Enfant noir, un roman autobiographique qui retrace son enfance ?", answer: "Camara Laye" },
+                { points: 10, question: "Quel écrivain malien, maître du conte et de la tradition orale, est l’auteur de L’Étrange destin de Wangrin ?", answer: "Amadou Hampâté Bâ" },
+                { points: 10, question: "Quel poète, conteur et vétérinaire sénégalais, héritier de la tradition orale africaine, a contribué à la redécouverte de la sagesse des griots dans ses Contes d’Amadou Koumba ?", answer: "Birago Diop" },
+                { points: 10, question: "Quel écrivain sénégalais, à travers son roman philosophique L’Aventure ambiguë, interroge le conflit entre tradition africaine et éducation occidentale à travers le parcours de Samba Diallo, tiraillé entre foi, identité et raison ?", answer: "Cheikh Hamidou Kane" }
+            ],
+            "Éclairs (Série 2)": [ 
+                // ** Deuxième série d'Éclairs (ajoutée par l'utilisateur) **
+                { points : 10, question : "Ce paquebot de luxe, présenté à l’époque comme « insubmersible », sombra tragiquement après avoir heurté un iceberg dans l’Atlantique Nord, provoquant la mort de 1 513 passagers et laissant 705 survivants. Il s’agit bien sûr du Titanic. Dites-moi, en quelle année cette tragédie a-t-elle eu lieu ?", answer: "1912" },
+                { points : 10, question : "Si on additionne ceux accompagnant Blanche Neige à ceux officiant à l'origine dans Fort-Boyard, combien obtient-on de nains ?", answer: "neuf" },
+                { points : 10, question : "Quelle cité fut opposée à Athènes lors de la guerre du Péloponnèse ?", answer: "Spartes" },
+                { points : 10, question : "De quel empire Manco Capac est-il le fondateur légendaire ?", answer: "Inca" },
+                { points : 10, question : "Quel maréchal français fut surnommé 'le vainqueur de Verdun' ?", answer: "Philippe Pétain" },
+                { points : 10, question : "Quels personnages de BD sont apparus sous les noms X33 et X33 bis en 1934 ?", answer: "Dupond et Dupont" },
+                { points : 10, question : "Quelle version de Windows a succédé à Windows 7 fin 2012 ?", answer: "Windows 8" },
+                { points : 10, question : "Que s'abstient de consommer une personne abstème ?", answer: "alcool" },
+                { points : 10, question : "Qui résuma sa campagne victorieuse contre Pharnasse 2 par le célèbre 'Veni, Vidi, Vici' ?", answer: "Jules César" },
+                { points : 10, question : "Sous quel pseudonyme est plus connu le héros de BD Steve Rodgers, interprété en 2011 par Chris Evans ?", answer: "Captain America" },
+            ],
+            "Qui, Que, Où suis-je ?": [
+                { points: 10, question: "Qui suis-je ? Philosophe grec, élève de Socrate et maître d’Aristote, auteur de « La République ».", answer: "Platon" },
+                { points: 10, question: "Que suis-je ? Utilisé en architecture et en sculpture, je suis un support vertical qui soutient un arc ou un plafond, souvent décoré de motifs.", answer: "Un pilier" },
+                { points: 10, question: "Où suis-je ? Montagne sacrée où Moïse reçut les tables de la Loi selon la Bible.", answer: "Le Mont Sinaï" },
+                { points: 10, question: "Qui suis-je ? Philosophe allemand du XIXe siècle, auteur du « Ainsi parlait Zarathoustra » et théoricien du concept de « volonté de puissance ».", answer: "Friedrich Nietzsche" },
+                { points: 10, question: "Que suis-je ? Science qui étudie les nombres, les formes, les espaces et les structures logiques pour résoudre des problèmes abstraits.", answer: "Les mathématiques" },
+                { points: 10, question: "Où suis-je ? Ville italienne surnommée « la Sérénissime », célèbre pour ses canaux et son carnaval.", answer: "Venise" },
+                { points: 10, question: "Qui suis-je ? Leader sud-africain, symbole de la lutte contre l’apartheid et premier président noir d’Afrique du Sud.", answer: "Nelson Mandela" },
+                { points: 10, question: "Que suis-je ? Mot masculin, je désigne aussi bien un avis de contravention qu'un nœud de cravate plat. Je suis surtout un insecte à quatre ailes, après métamorphose de la chenille.", answer: "Un papillon" },
+                { points: 10, question: "Où suis-je ? Fleuve africain, deuxième plus long du continent après le Nil, traversant la République Démocratique du Congo.", answer: "Le fleuve Congo" },
+                { points: 10, question: "Que suis-je ? Mouvement littéraire et artistique du XVIIe siècle en France, caractérisé par le goût de l’exagération et des effets surprenants.", answer: "Le baroque" }
+            ],
+            "Thème unique : Les langues du monde": [
+                { points: 10, question: "Quelle langue tonale, écrite avec des sinogrammes, est la plus parlée au monde en tant que langue maternelle ?", answer: "Le mandarin" },
+                { points: 10, question: "Quelle langue romane, issue du latin vulgaire, est la seule à être parlée sur les cinq continents comme langue officielle ?", answer: "Le français" },
+                { points: 10, question: "Quelle langue germanique, devenue lingua franca mondiale, est la plus apprise comme langue étrangère ?", answer: "L’anglais" },
+                { points: 10, question: "Quelle langue sémitique, écrite de droite à gauche, est langue officielle dans plus de 20 pays ?", answer: "L’arabe" },
+                { points: 10, question: "Quelle langue bantoue, parlée en Afrique de l’Est, est utilisée comme langue véhiculaire au Kenya, en Tanzanie et en Ouganda ?", answer: "Le swahili" },
+                { points: 10, question: "Quelle langue indo-européenne, parlée en Amérique latine et en Espagne, est la deuxième langue maternelle la plus parlée au monde ?", answer: "L’espagnol" },
+                { points: 10, question: "Quelle langue asiatique, utilisant l’alphabet hangul, est parlée au nord et au sud de la péninsule coréenne ?", answer: "Le coréen" },
+                { points: 10, question: "Quelle langue slave, écrite en alphabet cyrillique, est la langue officielle de la Russie ?", answer: "Le russe" },
+                { points: 10, question: "Quelle langue germanique, dérivée du néerlandais, est parlée en Afrique du Sud et en Namibie ?", answer: "L’afrikaans" },
+                { points: 10, question: "Quelle langue officielle du Luxembourg est un mélange de français, d’allemand et de dialectes mosellans ?", answer: "Le luxembourgeois" }
+            ],
+            "Lettre du match : Lettre A": [
+                { points: 10, question: "Quel est cette organisation secrète dont les membres portaient une robe noire avec des motifs en forme de nuages rouges ?", answer: "Akatsuki" },
+                { points: 10, question: "Quel explorateur italien a donné son nom au continent américain après ses voyages et descriptions du Nouveau Monde ?", answer: "Amerigo Vespucci" },
+                { points: 10, question: "Quel continent découvert par les Européens à partir du XVe siècle est surnommé le Nouveau Monde ?", answer: "Amérique" },
+                { points: 10, question: "Quel émir arabe d'Algérie dirigea pendant quinze ans la résistance algérienne contre la colonisation française ?", answer: "Abd el-Kader" },
+                { points: 10, question: "Comment s’appelle celui qui a une peur excessive du public ou des foules ?", answer: "Agoraphobe" },
+                { points: 10, question: "Quel fruit tropical, apprécié pour sa chair sucrée et orangée, est aussi surnommé prune malgache ?", answer: "Abricot" },
+                { points: 10, question: "Quel pays d’Asie centrale, connu pour son histoire riche et ses paysages montagneux, a pour capitale Kaboul ?", answer: "Afghanistan" },
+                { points: 10, question: "Quel est le gaz noble utilisé dans l'éclairage et identifié par le symbole chimique Ar ?", answer: "Argon" },
+                { points: 10, question: "Quel métal précieux, connu pour sa brillance et ses usages en joaillerie, porte le symbole chimique Ag ?", answer: "Argent" },
+                { points: 10, question: "Quelle ville perchée à plus de 2 000 mètres d’altitude est la capitale de l’Érythrée et un exemple remarquable d’urbanisme moderniste ?", answer: "Asmara" }
+            ],
+            "Éclairs (Série 3)": [
+                { points: 10, question: "Quel roi de France, surnommé Le Roi Soleil, a dirigé le pays pendant plus de 72 ans ?", answer: "Louis XIV" },
+                { points: 10, question: "Quelle entreprise spécialisée en intelligence artificielle est à l’origine du développement de ChatGPT ?", answer: "OpenAI" },
+                { points: 10, question: "Quelle échelle météorologique, utilisée pour mesurer la force du vent, porte le nom de son créateur et s’étend de 0 à 12 ?", answer: "L’échelle de Beaufort" },
+                { points: 10, question: "Comment appelle-t-on une personne qui possède une grande habileté avec ses deux mains, capable d’écrire ou de manipuler des objets avec indifféremment la droite ou la gauche ?", answer: "Un ambidextre" },
+                { points: 10, question: "Quel militant américain, célèbre pour sa lutte pour les droits civiques et son éloquence, était connu sous le nom d’El-Hajj Malek El-Shabazz ?", answer: "Malcolm X" },
+                { points: 10, question: "Que signifie le mot hébreu Eden ?", answer: "Délice" },
+                { points: 10, question: "Comment se nomme la zone d’un volcan où montent les laves et les projections volcaniques ?", answer: "La cheminée" },
+                { points: 10, question: "Quel mot commençant par la lettre 'K', est le nom que l'on donne à une fête en plein air, avec des jeux ?", answer: "Kermesse" },
+                { points: 10, question: "211 chambres dont 82 ont une vue sur mer, 2 restaurants dont un gastronomique, 2 bars et une piscine olympique, 2 courts de tennis, 1 terrain de golf et un centre d'équitation, quelle hôtel 4 étoiles situé sur la plage de Lomé au milieu d'une cocoteraie de 25 hectares dispose de toutes ces commodités ?", answer: "L'hôtel Sarakawa" },
+                { points: 10, question: "Quel volcan éteint est la plus haute montagne du Japon ?", answer: "Fuji-Yama" }
+            ],
+            "Cascades (A-Z)": [
+                { points: 10, question: "Quel manga créé en 1982 nous présente une vision post-apocalyptique de la ville de Néo-Tokyo à travers la plume de Katshuhiro Otomo ?", answer: "Akira", requiredLetter: 'A' },
+                { points: 10, question: "Comment appelle-t-on un habitant du Royaume-Uni ?", answer: "Britannique", requiredLetter: 'B' },
+                { points: 10, question: "En biologie, de quel élément du noyau des cellules le télomère et le centromère sont-ils des composants ?", answer: "CHROMOSOME", requiredLetter: 'C' },
+                { points: 10, question: "D'après une expression proverbiale, combien un homme averti en vaut-il ?", answer: "Deux", requiredLetter: 'D' },
+                { points: 10, question: "En 306 avant J.-C., quel philosophe crée à Athènes une école philosophique appelée 'Le Jardin' ?", answer: "Épicure", requiredLetter: 'E' },
+                { points: 10, question: "Quel est le prénom du dirigeant politique qui détient le record du plus long discours jamais prononcé à l’Assemblée générale des Nations Unies, avec plus de 4 heures de prise de parole en 1960 ?", answer: "Fidel", requiredLetter: 'F' },
+                { points: 10, question: "Le bombardement de quelle petite ville basque a voulu dénoncer Pablo Picasso dans une de ses œuvres ?", answer: "Guernica", requiredLetter: 'G' },
+                { points: 10, question: "De quel crime Galilée fut-il accusé pour avoir affirmé que la terre n’était pas au centre de l’univers ?", answer: "Hérésie", requiredLetter: 'H' },
+                { points: 10, question: "En art, quel adjectif commençant par la voyelle i désigne une statue dont le sujet est en érection ?", answer: "Ithyphallique", requiredLetter: 'I' },
+                { points: 10, question: "Quel hors-la-loi américain était surnommé le 'Brigand bien-aimé' ?", answer: "Jesse James", requiredLetter: 'J' },
+                { points: 10, question: "Quel arbre d'Afrique tropicale de la famille des sapotacées fournit une matière grasse d'usage culinaire et cosmétique ?", answer: "Karité", requiredLetter: 'K' },
+                { points: 10, question: "En 2011, dans quel pays africain la France intervient-elle à travers l’opération Harmattan ?", answer: "La Libye", requiredLetter: 'L' },
+                { points: 10, question: "Quel impressionniste barbu, parfois confondu avec Manet, reste indissociable de ses nymphéas ?", answer: "Claude Monet", requiredLetter: 'M' },
+                { points: 10, question: "Qui était président des Etats-Unis d'Amérique lorsque Neil Armstrong a marché sur la Lune ?", answer: "Richard Nixon", requiredLetter: 'N' },
+                { points: 10, question: "Quel singe tient son nom du malais signifiant « homme des bois » ?", answer: "L’orang-outan", requiredLetter: 'O' },
+                { points: 10, question: "De quelle langue européenne sont issus les mots serval, bambou, macaque et banane ?", answer: "PORTUGAIS", requiredLetter: 'P' },
+                { points: 10, question: "Combien y a-t-il d'atomes de fluor dans une molécule de Tétrafluorure de carbone ?", answer: "Quatre", requiredLetter: 'Q' },
+                { points: 10, question: "Quelle maladie de l'enfance est principalement due à une carence en vitamine D ?", answer: "Rachitisme", requiredLetter: 'R' },
+                { points: 10, question: "Quel pays africain a perdu le quart de sa superficie suite à l’indépendance du Soudan du Sud ?", answer: "Le Soudan", requiredLetter: 'S' },
+                { points: 10, question: "Quel nom donne-t-on à la triple couronne, d’origine babylonienne, qui figure sur les armoiries des papes catholiques ?", answer: "Tiare", requiredLetter: 'T' },
+                { points: 10, question: "La chanson L’internationale fut l’hymne de quel pays de 1922 à 1944 ?", answer: "L’URSS", requiredLetter: 'U' },
+                { points: 10, question: "Le personnage de comics Norman Osborn, un des ennemis emblématiques de Spiderman, est surnommé le Bouffon...", answer: "Vert", requiredLetter: 'V' },
+                { points: 10, question: "Quel tournoi, organisé pour la première fois en 1877, est le plus ancien et prestigieux événement du tennis ?", answer: "Wimbledon", requiredLetter: 'W' },
+                { points: 10, question: "Par quelle lettre se termine le mot tuyau quand il est écrit au pluriel ?", answer: "X", requiredLetter: 'X' },
+                { points: 10, question: "Quelle est la monnaie officielle du Japon ?", answer: "Yen", requiredLetter: 'Y' },
+                { points: 10, question: "Quel footballeur a inscrit 2 buts de la tête en finale de la Coupe du monde 1998 ?", answer: "Zinédine Zidane", requiredLetter: 'Z' }
+            ],
+            // ** NOTE : La rubrique Éclairs (Série 4) de l'historique précédent manque ici, l'utilisateur a demandé d'ajouter Cascades avant l'éclair de fin (qui est Série 3 dans ce contexte) **
+            "Éclairs (Série 4)": [ 
+                // Données de l'interaction précédente (que j'ai renommée Série 4)
+                { points: 10, question: "Quel roi de France, surnommé Le Roi Soleil, a dirigé le pays pendant plus de 72 ans ?", answer: "Louis XIV" },
+                { points: 10, question: "Quelle entreprise spécialisée en intelligence artificielle est à l’origine du développement de ChatGPT ?", answer: "OpenAI" },
+                { points: 10, question: "Quelle échelle météorologique, utilisée pour mesurer la force du vent, porte le nom de son créateur et s’étend de 0 à 12 ?", answer: "L’échelle de Beaufort" },
+                { points: 10, question: "Comment appelle-t-on une personne qui possède une grande habileté avec ses deux mains, capable d’écrire ou de manipuler des objets avec indifféremment la droite ou la gauche ?", answer: "Un ambidextre" },
+                { points: 10, question: "Quel militant américain, célèbre pour sa lutte pour les droits civiques et son éloquence, était connu sous le nom d’El-Hajj Malek El-Shabazz ?", answer: "Malcolm X" },
+                { points: 10, question: "Que signifie le mot hébreu Eden ?", answer: "Délice" },
+                { points: 10, question: "Comment se nomme la zone d’un volcan où montent les laves et les projections volcaniques ?", answer: "La cheminée" },
+                { points: 10, question: "Quel mot commençant par la lettre 'K', est le nom que l'on donne à une fête en plein air, avec des jeux ?", answer: "Kermesse" },
+                { points: 10, question: "211 chambres dont 82 ont une vue sur mer, 2 restaurants dont un gastronomique, 2 bars et une piscine olympique, 2 courts de tennis, 1 terrain de golf et un centre d'équitation, quelle hôtel 4 étoiles situé sur la plage de Lomé au milieu d'une cocoteraie de 25 hectares dispose de toutes ces commodités ?", answer: "L'hôtel Sarakawa" },
+                { points: 10, question: "Quel volcan éteint est la plus haute montagne du Japon ?", answer: "Fuji-Yama" }
+            ]
+        };
+
+        const SHUFFLEABLE_SECTIONS = [
+            "Duel des capitaines",
+            "Éclairs (Série 1)",
+            "Lettre du match (M)",
+            "Spécialités : Histoire",
+            "Spécialités : Géographie",
+            "Spécialités : Art et littérature",
+            "Spécialités : Sport",
+            "Lettre du match : lettre E",
+            "Thème : Les célèbres auteurs africains",
+            "Éclairs (Série 2)",
+            "Qui, Que, Où suis-je ?",
+            "Thème unique : Les langues du monde",
+            "Lettre du match : Lettre A",
+            "Éclairs (Série 3)",
+            "Cascades (A-Z)",
+            "Éclairs (Série 4)",
+        ];
+
+        let QUIZ_DATA_FINAL = [];
+
+        // Fonction d'aide pour mélanger un tableau
+        function shuffleArray(array) {
+            for (let i = array.length - 1; i > 0; i--) {
+                const j = Math.floor(Math.random() * (i + 1));
+                [array[i], array[j]] = [array[j], array[i]];
+            }
+            return array;
+        }
+
+        // Construction du tableau final des questions en respectant l'ordre des rubriques et le mélange interne sélectif
+        for (const sectionName of Object.keys(RAW_QUIZ_DATA)) {
+            let questions = [...RAW_QUIZ_DATA[sectionName]]; // Copie pour ne pas modifier l'original
+            if (SHUFFLEABLE_SECTIONS.includes(sectionName)) {
+                questions = shuffleArray(questions);
+            }
+            questions.forEach(q => {
+                QUIZ_DATA_FINAL.push({ ...q, section: sectionName });
+            });
+        }
+
+        const appContainer = document.getElementById('app-container');
+        const modal = document.getElementById('modal');
+        const modalTitle = document.getElementById('modal-title');
+        const modalMessage = document.getElementById('modal-message');
+        const modalButton = document.getElementById('modal-button');
+        const modalCancelButton = document.getElementById('modal-cancel-button');
+        let quizTimerTimeout = null;
+
+        /**
+         * Affiche une modale de confirmation ou d'information.
+         * @param {string} title - Titre de la modale.
+         * @param {string} message - Message dans la modale.
+         * @param {function} callback - Fonction à exécuter lors de la confirmation.
+         * @param {function} [cancelCallback] - Fonction à exécuter lors de l'annulation (si confirmation requise).
+         */
+        function showModal(title, message, callback, cancelCallback = null) {
+            modalTitle.textContent = title;
+            modalMessage.innerHTML = message;
+            modal.classList.remove('hidden');
+            modal.classList.add('flex');
+            
+            modalButton.textContent = cancelCallback ? "Confirmer" : "Continuer";
+            modalButton.onclick = () => {
+                modal.classList.add('hidden');
+                modal.classList.remove('flex');
+                if (callback) callback();
+            };
+
+            if (cancelCallback) {
+                modalCancelButton.classList.remove('hidden');
+                modalCancelButton.textContent = "Annuler";
+                modalCancelButton.onclick = () => {
+                    modal.classList.add('hidden');
+                    modal.classList.remove('flex');
+                    cancelCallback();
+                };
+            } else {
+                modalCancelButton.classList.add('hidden');
+            }
+        }
+
+        /**
+         * Nettoie une chaîne de réponse pour une comparaison de base (minuscule, sans accent ni ponctuation)
+         * @param {string} answer - La chaîne de réponse.
+         * @returns {string} La chaîne nettoyée.
+         */
+        function cleanAnswer(answer) {
+            // Retire les accents, passe en minuscule, et supprime la plupart des ponctuations
+            return answer
+                .toLowerCase()
+                .normalize('NFD').replace(/[\u0300-\u036f]/g, "")
+                .replace(/[.,\/#!$%\^&\*;:{}=\-_`~()]/g, "")
+                .trim();
+        }
+
+        /**
+         * Calcule la distance de Levenshtein (nombre minimal d'éditions nécessaires) entre deux mots.
+         */
+        function getEditDistance(a, b) {
+            if (a.length === 0) return b.length;
+            if (b.length === 0) return a.length;
+
+            const matrix = [];
+
+            for (let i = 0; i <= b.length; i++) {
+                matrix[i] = [i];
+            }
+            for (let j = 0; j <= a.length; j++) {
+                matrix[0][j] = j;
+            }
+
+            for (let i = 1; i <= b.length; i++) {
+                for (let j = 1; j <= a.length; j++) {
+                    const cost = a[j - 1] === b[i - 1] ? 0 : 1;
+                    matrix[i][j] = Math.min(
+                        matrix[i - 1][j] + 1,       // Suppression
+                        matrix[i][j - 1] + 1,       // Insertion
+                        matrix[i - 1][j - 1] + cost // Substitution
+                    );
+                }
+            }
+            return matrix[b.length][a.length];
+        }
+
+        // --- Logique Firestore ---
+
+        function getUserId() {
+            const userId = auth.currentUser?.uid || (typeof crypto !== 'undefined' ? crypto.randomUUID() : 'anonymous-' + Math.random().toString(36).substring(2, 9));
+            return userId;
+        }
+
+        async function initFirebase() {
+            try {
+                if (firebaseConfig) {
+                    app = initializeApp(firebaseConfig);
+                    db = getFirestore(app);
+                    auth = getAuth(app);
+
+                    if (initialAuthToken) {
+                        await signInWithCustomToken(auth, initialAuthToken);
+                    } else {
+                        await signInAnonymously(auth);
+                    }
+                    gameState.userId = getUserId();
+                    gameState.isAuthReady = true;
+                    console.log("Firebase et Authentification prêts. User ID:", gameState.userId);
+                    renderApp();
+                    setupLeaderboardListener();
+                } else {
+                    console.error("Firebase config is missing.");
+                    showModal("Erreur de Configuration", "La configuration Firebase est manquante. Le classement ne sera pas sauvegardé.", () => {
+                         gameState.isAuthReady = false;
+                         renderApp();
+                    });
+                }
+            } catch (error) {
+                console.error("Erreur d'initialisation Firebase:", error);
+                showModal("Erreur", "Problème de connexion à la base de données. Le classement ne sera pas sauvegardé.", () => {
+                    gameState.isAuthReady = false;
+                    renderApp();
+                });
+            }
+        }
+
+        function getPublicScoresCollectionRef() {
+            return collection(db, 'artifacts', appId, 'public/data/scores');
+        }
+
+        async function saveScore() {
+            if (!gameState.isAuthReady || gameState.currentScore === 0) return;
+
+            const userRef = doc(getPublicScoresCollectionRef(), gameState.userId);
+            const scoreData = {
+                id: gameState.userId,
+                name: `${gameState.userFirstName} ${gameState.userName}`,
+                score: gameState.currentScore,
+                timestamp: serverTimestamp(),
+            };
+
+            try {
+                await setDoc(userRef, scoreData, { merge: true });
+                console.log("Score enregistré avec succès.");
+            } catch (e) {
+                console.error("Erreur lors de l'enregistrement du score: ", e);
+            }
+        }
+
+        function setupLeaderboardListener() {
+            if (!gameState.isAuthReady) return;
+
+            const scoresQuery = query(
+                getPublicScoresCollectionRef(),
+                orderBy('score', 'desc'),
+                limit(10) 
+            );
+
+            onSnapshot(scoresQuery, (snapshot) => {
+                let leaderboard = [];
+                snapshot.forEach((doc) => {
+                    leaderboard.push(doc.data());
+                });
+
+                leaderboard.sort((a, b) => {
+                    if (a.score !== b.score) {
+                        return b.score - a.score;
+                    }
+                    const timeA = a.timestamp?.seconds || 0;
+                    const timeB = b.timestamp?.seconds || 0;
+                    return timeB - timeA;
+                });
+                
+                gameState.leaderboard = leaderboard;
+                console.log("Classement mis à jour.");
+                renderApp(); 
+            }, (error) => {
+                console.error("Erreur d'écoute du classement:", error);
+            });
+        }
+
+
+        // --- Logique du Jeu ---
+
+        function startQuiz() {
+            const nameInput = document.getElementById('name-input');
+            const firstNameInput = document.getElementById('firstname-input');
+
+            if (!nameInput.value.trim() || !firstNameInput.value.trim()) {
+                showModal("Attention", "Veuillez entrer votre nom et prénom pour commencer la compétition.");
+                return;
+            }
+
+            gameState.userName = nameInput.value.trim();
+            gameState.userFirstName = firstNameInput.value.trim();
+            
+            // Vérification de la règle "ne peut jouer qu'une seule fois" (par ID)
+            const hasExistingScore = gameState.leaderboard.some(item => item.id === gameState.userId);
+
+            if (hasExistingScore) {
+                showModal(
+                    "Partie Déjà Terminée", 
+                    `Un score a déjà été enregistré pour cet identifiant (${gameState.userId}). Vous ne pouvez pas recommencer le match.`, 
+                    () => {
+                        gameState.view = 'results';
+                        renderApp();
+                    }
+                );
+                return;
+            }
+
+            // Réinitialisation de la partie
+            gameState.currentScore = 0;
+            gameState.currentQIndex = 0;
+            gameState.userAnswers = []; // Réinitialise l'historique des réponses
+            gameState.view = 'quiz';
+            renderApp();
+            startQuestion();
+        }
+
+        function startTimer() {
+            // Logique du minuteur dynamique : 10s par 50 caractères, minimum 15s
+            const currentQ = QUIZ_DATA_FINAL[gameState.currentQIndex];
+            const charCount = currentQ.question.length;
+            const estimatedLines = Math.ceil(charCount / 50); 
+            
+            // Réinitialisation de l'initialTimer uniquement si la question change
+            if (!gameState.isPaused) {
+                gameState.initialTimer = Math.max(15, estimatedLines * 10);
+                gameState.timer = gameState.initialTimer;
+            }
+            
+            clearInterval(gameState.timerInterval);
+            gameState.timerInterval = setInterval(() => {
+                if (gameState.isPaused) {
+                    clearInterval(gameState.timerInterval); // Stop interval si on passe en pause
+                    return;
+                }
+
+                gameState.timer--;
+                const timerDisplay = document.getElementById('timer-display');
+                if (timerDisplay) timerDisplay.textContent = gameState.timer;
+
+                const timerRing = document.getElementById('timer-ring');
+                if (timerRing) {
+                    if (gameState.timer <= 5) {
+                        timerRing.classList.add('timer-ring');
+                    } else {
+                        timerRing.classList.remove('timer-ring');
+                    }
+                }
+
+                if (gameState.timer <= 0) {
+                    clearInterval(gameState.timerInterval);
+                    processAnswer(document.getElementById('answer-input').value, true);
+                }
+            }, 1000);
+        }
+
+        function pauseQuiz() {
+            if (gameState.isPaused) {
+                // Reprendre
+                gameState.isPaused = false;
+                startTimer(); // Redémarre le compte à rebours avec le temps restant
+                renderApp(); 
+            } else {
+                // Pause
+                gameState.isPaused = true;
+                clearInterval(gameState.timerInterval);
+                renderApp(); 
+            }
+        }
+
+        function abandonQuiz() {
+            showModal(
+                // "Abandonner la Partie",
+                "Pathétique...",
+                // "Êtes-vous sûr de vouloir abandonner le match ? Votre score actuel ne sera pas enregistré, mais vous pourrez rejouer plus tard.",
+                "Vous allez tout laisser tomber ? Ce match, ce score, ces efforts... tout réduit à néant. Rien ne sera enregistré. Rien ne restera. Vous pourrez rejouer, oui... mais ce moment, lui, ne reviendra jamais.",
+                () => {
+                    clearInterval(gameState.timerInterval);
+                    clearTimeout(quizTimerTimeout);
+                    // Réinitialisation de l'état pour permettre de rejouer
+                    gameState.currentScore = 0;
+                    gameState.currentQIndex = 0;
+                    gameState.userAnswers = [];
+                    gameState.view = 'login';
+                    gameState.isPaused = false;
+                    renderApp();
+                },
+                () => {} // Annulation
+            );
+        }
+
+        function processAnswer(userAnswer, isTimedOut = false) {
+            clearInterval(gameState.timerInterval);
+            clearTimeout(quizTimerTimeout); // S'assurer que le délai de 3s est effacé si l'utilisateur répond vite
+            
+            const currentQ = QUIZ_DATA_FINAL[gameState.currentQIndex];
+            const cleanUserAnswer = cleanAnswer(userAnswer);
+            const cleanCorrectAnswer = cleanAnswer(currentQ.answer);
+
+            // Tolérance : Max 2 fautes ou 20% de la longueur de la réponse (pour les longues réponses)
+            const maxEditDistance = Math.max(1, Math.min(2, Math.ceil(cleanCorrectAnswer.length * 0.2))); 
+            const distance = getEditDistance(cleanUserAnswer, cleanCorrectAnswer);
+
+            const isCorrect = distance <= maxEditDistance;
+            let pointsAwarded = 0;
+            let feedbackTitle = "";
+            let feedbackClass = "";
+            let feedbackMessage = "";
+
+            // Logique de score spéciale pour "Cascades"
+            if (currentQ.section === "Cascades (A-Z)") {
+                const requiredLetter = currentQ.requiredLetter.toUpperCase();
+                const userFirstLetter = cleanUserAnswer.charAt(0).toUpperCase();
+                const startsWithCorrectLetter = userFirstLetter === requiredLetter;
+
+                if (isCorrect && startsWithCorrectLetter) {
+                    pointsAwarded = currentQ.points; // +20
+                    feedbackTitle = "CASCADE RÉUSSIE !";
+                    feedbackClass = "correct-feedback";
+                    feedbackMessage = `Excellent ! La réponse <strong>${currentQ.answer}</strong> commence bien par ${requiredLetter}. <br>Vous gagnez ${pointsAwarded} points.`;
+                } else {
+                    pointsAwarded = -10; // Pénalité
+                    feedbackTitle = "PÉNALITÉ (-10 PTS)";
+                    feedbackClass = "incorrect-feedback";
+                    if (isCorrect && !startsWithCorrectLetter) {
+                        feedbackMessage = `La réponse <strong>${currentQ.answer}</strong> est correcte, mais elle ne commence pas par ${requiredLetter}.`;
+                    } else if (!isCorrect && startsWithCorrectLetter) {
+                        feedbackMessage = `La réponse commence bien par ${requiredLetter}, mais elle est incorrecte. <br>La bonne réponse était : <strong>${currentQ.answer}</strong>.`;
+                    } else {
+                        feedbackMessage = `Réponse incorrecte. La bonne réponse était : <strong>${currentQ.answer}</strong> (devait commencer par ${requiredLetter}).`;
+                    }
+                }
+            } else {
+                // Logique normale pour les autres sections
+                if (isCorrect) {
+                    pointsAwarded = currentQ.points;
+                    feedbackTitle = "CORRECT !";
+                    feedbackClass = "correct-feedback";
+                    feedbackMessage = `${isTimedOut ? "Temps écoulé. " : ""} ${isCorrect ? `Tolérance acceptée (Distance: ${distance}). Vous gagnez ${pointsAwarded} points.` : 'Pas de point.'} <br>La bonne réponse était : <strong>${currentQ.answer}</strong>.`;
+                } else {
+                    pointsAwarded = 0;
+                    feedbackTitle = "INCORRECT !";
+                    feedbackClass = "incorrect-feedback";
+                    feedbackMessage = `${isTimedOut ? "Temps écoulé. " : ""} ${isCorrect ? `Tolérance acceptée (Distance: ${distance}). Vous gagnez ${pointsAwarded} points.` : 'Pas de point.'} <br>La bonne réponse était : <strong>${currentQ.answer}</strong>.`;
+                }
+            }
+            
+            gameState.currentScore += pointsAwarded;
+
+            // Enregistrer la réponse pour le récapitulatif
+            gameState.userAnswers.push({
+                index: gameState.currentQIndex + 1,
+                question: currentQ.question,
+                correctAnswer: currentQ.answer,
+                userAnswer: userAnswer.trim() || 'N/A (Temps écoulé)',
+                points: currentQ.points,
+                pointsAwarded: pointsAwarded,
+                isCorrect: isCorrect,
+                section: currentQ.section
+            });
+
+            // Si ce n'est pas une cascade, définir les messages de feedback standards (s'ils n'ont pas été définis par la logique normale)
+            if (currentQ.section !== "Cascades (A-Z)") {
+                if (!isCorrect && !isTimedOut) {
+                    feedbackMessage += `<br><span class="text-sm text-gray-200">Distance d'édition: ${distance} (Max toléré: ${maxEditDistance})</span>`;
+                }
+            }
+            
+            // Vérification de la fin de rubrique avant de passer à la question suivante
+            const checkNextStep = () => {
+                gameState.currentQIndex++;
+
+                if (gameState.currentQIndex < QUIZ_DATA_FINAL.length) {
+                    
+                    const currentSection = QUIZ_DATA_FINAL[gameState.currentQIndex - 1].section;
+                    const nextQ = QUIZ_DATA_FINAL[gameState.currentQIndex];
+                    
+                    // Vérification du changement de rubrique
+                    if (nextQ && nextQ.section !== currentSection) {
+                        showModal(
+                            "Rubrique Terminée ! 🎉",
+                            `Vous avez complété la rubrique : <strong>${currentSection}</strong>.<br>Préparez-vous pour la prochaine : <strong>${nextQ.section}</strong> !`,
+                            startQuestion // Appel à startQuestion après la fermeture de la modale
+                        );
+                    } else {
+                        startQuestion();
+                    }
+                } else {
+                    async function endQuiz() {
+                      try {
+                        await saveScoreLocal(); // toujours en local
+                      } catch (e) {
+                        console.error('Local save failed:', e);
+                      }
+
+                      // Tentative de sauvegarde distante (si prêt et en ligne)
+                      if (navigator.onLine && gameState.isAuthReady && gameState.currentScore > 0) {
+                        try {
+                          const userRef = doc(getPublicScoresCollectionRef(), gameState.userId);
+                          await setDoc(userRef, {
+                            id: gameState.userId,
+                            name: `${gameState.userFirstName} ${gameState.userName}`.trim(),
+                            score: gameState.currentScore,
+                            timestamp: serverTimestamp(),
+                          }, { merge: true });
+                          console.log('Score Firestore OK');
+                        } catch (e) {
+                          console.error('Firestore save failed, enqueue for later:', e);
+                          // Quoi qu'il arrive, stocké en file d'attente pour future sync
+                          await idbPut('syncQueue', {
+                            id: (typeof crypto !== 'undefined' ? crypto.randomUUID() : 'sync-' + Date.now()),
+                            userId: gameState.userId,
+                            name: `${gameState.userFirstName} ${gameState.userName}`.trim(),
+                            score: gameState.currentScore,
+                            timestamp: Date.now()
+                          });
+                        }
+                      }
+
+                      gameState.view = 'results';
+                      renderApp();
+                    }
+
+                                    }
+                                };
+            
+            // Mise à jour visuelle du conteneur de question
+            const questionContainer = document.getElementById('question-container');
+            if (questionContainer) {
+                questionContainer.innerHTML = `<div class="p-8 text-white rounded-xl ${feedbackClass} transition-all duration-300">
+                    <h3 class="text-3xl font-extrabold mb-4">${feedbackTitle}</h3>
+                    <p class="text-xl">${feedbackMessage}</p>
+                </div>`;
+            }
+            
+            document.getElementById('submit-button')?.classList.add('hidden');
+            document.getElementById('answer-input')?.setAttribute('disabled', 'true');
+
+            // Passer à la question suivante après 3 secondes
+            quizTimerTimeout = setTimeout(checkNextStep, 3000); 
+        }
+
+        function startQuestion() {
+            const currentQ = QUIZ_DATA_FINAL[gameState.currentQIndex];
+            renderQuizView(currentQ);
+            
+            // Le timer est démarré si la partie n'est pas en pause
+            if (!gameState.isPaused) {
+                startTimer();
+                setTimeout(() => document.getElementById('answer-input')?.focus(), 0);
+            }
+        }
+
+        function endQuiz() {
+            saveScore();
+            gameState.view = 'results';
+            renderApp();
+        }
+        
+        // --- Rendu des Vues ---
+
+        function renderLoginView() {
+            appContainer.innerHTML = `
+                <div class="quiz-card p-8 rounded-xl shadow-2xl w-full max-w-md mx-auto">
+                    <h2 class="text-3xl font-bold mb-6 text-white text-center">Woezon</h2>
+                    <p class="text-gray-400 mb-6 text-center">Veuillez entrer vos informations pour commencer la compétition et enregistrer votre score.</p>
+                    <div class="space-y-4">
+                        <input id="firstname-input" type="text" placeholder="Votre Prénom" class="w-full p-3 rounded-lg bg-gray-700 text-white border-none focus:ring-2 focus:ring-blue-500" value="${gameState.userFirstName}">
+                        <input id="name-input" type="text" placeholder="Votre Nom" class="w-full p-3 rounded-lg bg-gray-700 text-white border-none focus:ring-2 focus:ring-blue-500" value="${gameState.userName}">
+                    </div>
+                    <button id="start-button" class="mt-8 w-full py-3 rounded-lg font-bold text-xl text-white bg-green-600 hover:bg-green-700 transition duration-150 shadow-lg">
+                        Démarrer le Match
+                    </button>
+                    <p class="text-xs text-gray-500 mt-4 text-center">ID Joueur : ${gameState.userId}</p>
+                    ${!gameState.isAuthReady ? '<p class="text-red-500 mt-4 text-sm text-center">Mode Hors Ligne : Le classement ne sera pas sauvegardé.</p>' : ''}
+                </div>
+                ${renderLeaderboard()}
+            `;
+            document.getElementById('start-button').onclick = startQuiz;
+        }
+
+        function renderQuizView(q) {
+            appContainer.innerHTML = `
+                ${gameState.isPaused ? 
+                    `<div id="pause-overlay" class="pause-overlay fixed inset-0 flex items-center justify-center z-40 bg-black bg-opacity-75">
+                        <div class="p-10 text-center quiz-card rounded-xl shadow-2xl">
+                            <h3 class="text-4xl font-extrabold text-blue-400 mb-6">PAUSE</h3>
+                            <button id="resume-button" class="py-3 px-8 rounded-lg font-bold text-white bg-green-600 hover:bg-green-700 transition duration-150 shadow-lg">
+                                Reprendre la Partie
+                            </button>
+                        </div>
+                    </div>` : ''
+                }
+                <div class="flex flex-col md:flex-row gap-8 relative ${gameState.isPaused ? 'opacity-20 pointer-events-none' : ''}">
+                    <!-- Zone de Quiz (à gauche) -->
+                    <div class="md:w-3/4 flex flex-col space-y-6">
+                        <div class="quiz-card p-4 rounded-xl flex justify-between items-center shadow-lg">
+                            <div class="text-xl font-semibold">
+                                Question <span id="q-number">${gameState.currentQIndex + 1}</span> sur ${QUIZ_DATA_FINAL.length}
+                            </div>
+                            <div class="text-2xl font-bold text-yellow-400">
+                                Score : <span id="score-display">${gameState.currentScore}</span> Pts
+                            </div>
+                        </div>
+
+                        <div id="question-container" class="quiz-card p-6 md:p-8 rounded-xl shadow-xl min-h-[250px] flex flex-col justify-center">
+                            <p class="text-lg text-blue-400 font-medium mb-3">
+                                Rubrique : ${q.section} (Valeur : ${q.points} points)
+                                ${q.requiredLetter ? `<span class="ml-2 px-3 py-1 bg-red-600 text-white text-sm font-bold rounded-full">LETTRE : ${q.requiredLetter}</span>` : ''}
+                            </p>
+                            <p class="text-2xl md:text-3xl font-semibold text-white">
+                                <span class="text-yellow-400 mr-2">${gameState.currentQIndex + 1}.</span> ${q.question}
+                            </p>
+                        </div>
+                        
+                        <div class="mt-4 flex flex-col md:flex-row gap-4">
+                            <input id="answer-input" type="text" placeholder="Votre réponse..." class="w-full p-4 rounded-lg bg-gray-700 text-white border-none text-xl focus:ring-4 focus:ring-blue-500 transition" autocomplete="off">
+                            <button id="submit-button" class="py-4 px-6 rounded-lg font-bold text-white bg-blue-600 hover:bg-blue-700 transition duration-150 flex-shrink-0">
+                                Valider
+                            </button>
+                        </div>
+                    </div>
+
+                    <!-- Chronomètre & Contrôles (à droite) -->
+                    <div class="md:w-1/4 flex flex-col items-center justify-start py-4 space-y-4">
+                        <div id="timer-ring" class="relative w-40 h-40 flex items-center justify-center rounded-full border-4 border-red-500/50">
+                            <div class="absolute inset-0 flex items-center justify-center">
+                                <span id="timer-display" class="text-6xl font-extrabold text-red-500">${gameState.timer}</span>
+                            </div>
+                            <div class="absolute bottom-4 text-red-500 font-semibold">SECONDES</div>
+                        </div>
+                        <div class="flex flex-col space-y-2 w-full max-w-[160px]">
+                            <button id="pause-button" class="py-2 px-4 rounded-lg font-semibold text-white bg-yellow-600 hover:bg-yellow-700 transition duration-150">
+                                Pause
+                            </button>
+                            <button id="abandon-button" class="py-2 px-4 rounded-lg font-semibold text-white bg-red-600 hover:bg-red-700 transition duration-150">
+                                Abandonner
+                            </button>
+                            <button id="skip-button" class="py-2 px-4 rounded-lg font-semibold text-white bg-green-500 hover:bg-green-600 transition duration-150 mt-2">
+                                Passer
+                            </button>
+
+                        </div>
+                    </div>
+                </div>
+            `;
+            
+            if (gameState.isPaused) {
+                document.getElementById('resume-button').onclick = pauseQuiz;
+            } else {
+                document.getElementById('submit-button').onclick = () => {
+                    const answer = document.getElementById('answer-input').value;
+                    if (answer.trim()) {
+                        processAnswer(answer);
+                    } else {
+                        showModal("Réponse Requise", "Veuillez entrer une réponse avant de valider.");
+                    }
+                };
+            }
+            document.getElementById('pause-button').onclick = pauseQuiz;
+            document.getElementById('abandon-button').onclick = abandonQuiz;
+            document.getElementById('skip-button').onclick = () => {
+                gameState.userAnswers.push({
+                    index: gameState.currentQIndex + 1,
+                    question: q.question,
+                    correctAnswer: q.answer,
+                    userAnswer: 'Passée',
+                    points: q.points,
+                    pointsAwarded: 0,
+                    isCorrect: false,
+                    section: q.section
+                });
+                clearInterval(gameState.timerInterval);
+                clearTimeout(quizTimerTimeout);
+                gameState.currentQIndex++;
+                if (gameState.currentQIndex < QUIZ_DATA_FINAL.length) {
+                    startQuestion();
+                } else {
+                    endQuiz();
+                }
+            };
+
+        }
+
+        function renderResultsView() {
+            appContainer.innerHTML = `
+                <div class="quiz-card p-10 rounded-xl shadow-2xl w-full mx-auto text-center mb-8">
+                    <h2 class="text-5xl font-extrabold text-green-400 mb-4">Match Terminé !</h2>
+                    <p class="text-3xl text-white mb-6">Félicitations, ${gameState.userFirstName} !</p>
+                    <p class="text-6xl font-black text-yellow-400">${gameState.currentScore}</p>
+                    <p class="text-2xl text-gray-300">Points Totaux</p>
+                    <div class="flex justify-center space-x-4 mt-8">
+                        <button id="summary-button" class="py-3 px-8 rounded-lg font-bold text-white bg-purple-600 hover:bg-purple-700 transition duration-150 shadow-lg">
+                            Voir le Récapitulatif
+                        </button>
+                        <button id="restart-button" class="py-3 px-8 rounded-lg font-bold text-white bg-blue-600 hover:bg-blue-700 transition duration-150 shadow-lg">
+                            Retour à l'Accueil
+                        </button>
+                    </div>
+                </div>
+                ${renderLeaderboard()}
+            `;
+            document.getElementById('restart-button').onclick = () => {
+                gameState.view = 'login';
+                renderApp();
+            };
+            document.getElementById('summary-button').onclick = () => {
+                gameState.view = 'summary';
+                renderApp();
+            };
+        }
+
+        function renderSummaryView() {
+            const summaryList = gameState.userAnswers.map(ans => {
+                const answerClass = ans.isCorrect ? 'summary-correct' : 'summary-incorrect';
+                const icon = ans.isCorrect ? '✅' : '❌';
+                return `
+                    <div class="border-b border-gray-700 py-4">
+                        <p class="text-lg font-semibold mb-2">
+                            <span class="text-blue-400">${ans.index}.</span> [${ans.section}] (${ans.pointsAwarded}/${ans.points} Pts)
+                        </p>
+                        <p class="mb-1 text-white">
+                            <span class="font-bold">Question :</span> ${ans.question}
+                        </p>
+                        <p class="mb-1">
+                            <span class="font-bold text-gray-400">Votre Réponse :</span> 
+                            <span class="${answerClass}">${ans.userAnswer} ${icon}</span>
+                        </p>
+                        <p class="mb-1 text-green-500">
+                            <span class="font-bold">Bonne Réponse :</span> ${ans.correctAnswer}
+                        </p>
+                    </div>
+                `;
+            }).join('');
+
+            appContainer.innerHTML = `
+                <div class="quiz-card p-8 rounded-xl shadow-2xl w-full mx-auto text-center mb-8">
+                    <h2 class="text-4xl font-extrabold text-purple-400 mb-2">Récapitulatif de la Partie</h2>
+                    <p class="text-2xl text-white mb-6">Score Final: <span class="text-yellow-400 font-bold">${gameState.currentScore} Pts</span></p>
+                    <button id="back-to-results-button" class="py-2 px-6 rounded-lg font-bold text-white bg-blue-600 hover:bg-blue-700 transition duration-150 shadow-lg">
+                        Retour aux Résultats
+                    </button>
+                </div>
+                <div class="quiz-card p-8 rounded-xl shadow-2xl w-full mx-auto mt-6">
+                    ${summaryList.length > 0 ? summaryList : '<p class="text-center text-gray-500">Aucune question enregistrée.</p>'}
+                </div>
+            `;
+            document.getElementById('back-to-results-button').onclick = () => {
+                gameState.view = 'results';
+                renderApp();
+            };
+        }
+
+        async function getRemoteLeaderboard(max = 10) {
+          if (!gameState.isAuthReady) return [];
+          const q = query(getPublicScoresCollectionRef(), orderBy('score', 'desc'), limit(max));
+          const snap = await getDocs(q);
+          const arr = [];
+          snap.forEach(docu => {
+              const d = docu.data();
+              arr.push({
+              userId: d.id,
+              name: d.name,
+              score: d.score,
+              timestamp: (d.timestamp?.seconds ? d.timestamp.seconds * 1000 : Date.now())
+              });
+          });
+          return arr;
+          }
+
+          async function getCombinedLeaderboard(max = 10) {
+          const local = await getLocalLeaderboard(max);
+          if (navigator.onLine && gameState.isAuthReady) {
+              const remote = await getRemoteLeaderboard(max);
+              const map = new Map();
+              for (const r of remote) map.set(r.userId, r);
+              for (const l of local) {
+              const existing = map.get(l.userId);
+              if (!existing || l.score > existing.score) {
+                  map.set(l.userId, l);
+              }
+              }
+              return Array.from(map.values())
+              .sort((a,b) => b.score - a.score || (b.timestamp - a.timestamp))
+              .slice(0, max);
+          } else {
+              return local;
+          }
+          }
+
+          function renderLeaderboardSection(items) {
+          const listItems = items.map((item, index) => `
+              <li class="flex justify-between items-center py-3 px-4 rounded-lg ${index < 3 ? 'bg-yellow-900/50 border-l-4 border-yellow-400' : 'bg-gray-800'} ${item.userId === gameState.userId ? 'ring-2 ring-blue-500' : ''}">
+              <span class="font-bold w-10 text-center">${index + 1}</span>
+              <span class="flex-grow text-left">${item.name || '(Anonyme)'} <span class="text-xs text-gray-500">ID: ${(item.userId || '').substring(0, 8)}...</span> ${item.userId === gameState.userId ? '(Vous)' : ''}</span>
+              <span class="font-extrabold text-yellow-300">${item.score} Pts</span>
+              </li>
+          `).join('');
+          return `
+              <div class="mt-10 p-6 quiz-card rounded-xl shadow-2xl w-full">
+              <h2 class="text-3xl font-bold mb-6 text-white text-center">Classement des Génies (Top 10)</h2>
+              <ul class="space-y-2 text-lg">
+                  ${listItems.length > 0 ? listItems : '<p class="text-center text-gray-500">Aucun score enregistré pour l\'instant.</p>'}
+              </ul>
+              ${(!navigator.onLine || !gameState.isAuthReady) ? '<p class="mt-3 text-center text-sm text-gray-400">(Mode hors ligne ou Firestore indisponible: classement local)</p>' : ''}
+              </div>
+          `;
+          }
+
+          async function renderLeaderboard() {
+          const items = await getCombinedLeaderboard(10);
+          return renderLeaderboardSection(items);
+          }
+
+
+        function renderApp() {
+            if (gameState.view !== 'quiz') {
+                // S'assurer que les intervalles sont effacés si on quitte la vue quiz
+                clearInterval(gameState.timerInterval);
+                clearTimeout(quizTimerTimeout);
+            }
+            
+            switch (gameState.view) {
+                case 'login':
+                    renderLoginView();
+                    break;
+                case 'quiz':
+                    // On appelle startQuestion/renderQuizView qui gère la pause
+                    const currentQ = QUIZ_DATA_FINAL[gameState.currentQIndex];
+                    if (currentQ) {
+                         renderQuizView(currentQ);
+                    }
+                    break;
+                case 'results':
+                    renderResultsView();
+                    break;
+                case 'summary':
+                    renderSummaryView();
+                    break;
+            }
+        }
+
+        // --- Initialisation ---
+        window.onload = async () => {
+        // ID joueur déterministe si non authentifié
+        gameState.userId = gameState.userId || (typeof crypto !== 'undefined' ? crypto.randomUUID() : 'anonymous-' + Math.random().toString(36).substring(2, 9));
+
+        if (firebaseConfig) {
+          await initFirebase();
+        } else {
+          console.warn("Firebase config not found. Running in local mode.");
+          gameState.isAuthReady = false;
+        }
+        renderApp();
+      };
+
+
+    </script>
+
+</body>
+</html>

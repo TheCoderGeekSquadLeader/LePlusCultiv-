@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Match de Génie en Herbe</title>
+    <!-- Tailwind CSS CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+
+    <script type="module" src="js/firebase.js"></script>
+    <script type="module" src="js/db.js"></script>
+    <script type="module" src="js/leaderboard.js"></script>
+    <script type="module" src="js/data.js"></script>
+    <script type="module" src="js/quiz.js"></script>
+
+    <!-- Font Inter (Pour un look moderne) -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&display=swap" rel="stylesheet">
+    <style>
+        body { font-family: 'Inter', sans-serif; background-color: #0d1117; color: #c9d1d9; }
+        .quiz-card { background-color: #161b22; border: 1px solid #30363d; }
+        .timer-ring { animation: pulse-red 1.5s infinite; }
+        @keyframes pulse-red { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+        .correct-feedback { background-color: #238636; border-color: #3f6e4a; }
+        .incorrect-feedback { background-color: #da3633; border-color: #8c3b3b; }
+        .loading-ring { border-top-color: #58a6ff; animation: spin 1s linear infinite; }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+        /* Style pour la surbrillance des réponses justes/fausses dans le récapitulatif */
+        .summary-correct { color: #238636; font-weight: 700; }
+        .summary-incorrect { color: #da3633; font-weight: 700; }
+        .pause-overlay { backdrop-filter: blur(8px); }
+    </style>
+</head>
+<body class="p-4 md:p-8 min-h-screen flex flex-col items-center justify-center">
+
+    <h1 class="text-4xl md:text-5xl font-extrabold mb-8 text-white text-center">
+        Match de Génie en Herbe
+    </h1>
+
+    <main id="app-container" class="w-full max-w-4xl">
+        <!-- Contenu de l'application rendu par JavaScript -->
+    </main>
+    
+    <!-- Modal pour les messages et le feedback -->
+    <div id="modal" class="fixed inset-0 bg-black bg-opacity-75 hidden items-center justify-center z-50">
+        <div id="modal-content" class="p-6 rounded-lg shadow-2xl w-11/12 max-w-lg text-center quiz-card">
+            <h2 id="modal-title" class="text-2xl font-bold mb-4"></h2>
+            <p id="modal-message" class="mb-6 text-lg"></p>
+            <div class="flex justify-center space-x-4">
+                <button id="modal-button" class="px-6 py-2 rounded-lg font-semibold text-white bg-blue-600 hover:bg-blue-700 transition duration-150">Continuer</button>
+                <button id="modal-cancel-button" class="hidden px-6 py-2 rounded-lg font-semibold text-white bg-gray-600 hover:bg-gray-700 transition duration-150">Annuler</button>
+            </div>
+        </div>
+    </div>
+</body>
+</html>
